@@ -1,0 +1,36 @@
+{
+  "manifest_version": 2,
+  "id": "mai_repeater",
+  "name": "麦麦的本质就是复读机",
+  "version": "1.0.0",
+  "description": "群聊复读插件：当群友复读时，插件会识别并直接通过sdk发送复读语录，防止分词器来自动断句，导致复读失败。"
+  "author": {
+    "name": "octmicy",
+    "url": "https://github.com/octmicy/Mai_repeater"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/octmicy/Mai_repeater",
+    "homepage": "https://github.com/octmicy/Mai_repeater",
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.6.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "plugin_type": "tool",
+  "capabilities": [
+    "send.text"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN",
+      "en-US"
+    ]
+  }
+}

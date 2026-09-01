@@ -1,0 +1,31 @@
+[plugin]
+enabled = true
+config_version = "1.0.0"
+
+[repeat]
+min_count = 3
+min_senders = 3
+window_seconds = 120.0
+max_text_length = 300
+cooldown_seconds = 90.0
+delay_min = 0.5
+delay_max = 2.0
+case_insensitive = false
+normalize_whitespace = true
+
+[once]
+# 同一句话的已复读记忆时长（秒）：只覆盖当次复读潮的上下文，5 分钟
+repeated_memory_ttl = 300.0
+
+[planner_guard]
+enabled = true
+# 待注入提示的有效期（秒）：只注入一次，注入后立即消费；超时未消费则作废
+pending_ttl = 180.0
+
+[filter]
+ignored_user_ids = []
+bot_user_ids = []
+
+[debug]
+dump_message_structure = false
+verbose_log = false
