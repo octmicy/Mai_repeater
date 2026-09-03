@@ -23,13 +23,9 @@ C：好好好
 
 ## 安装
 
-1. 把 `Mai_repeater` 整个文件夹复制到 MaiBot 的 `plugins/` 目录
-   （一键包通常在 `.../MaiBotOneKeyDesktop/<随机串>/modules/MaiBot/plugins/`）
+1. 把 `Mai_repeater` 整个文件夹复制到 MaiBot 的 `plugins/` 
 2. 重启 MaiBot
 3. 群里发 `/rp_stat` 能收到状态，说明加载成功
-
-> ⚠️ 如果你部署过旧版（目录名 `repeater`），**先删掉它**再复制新版，
-> 否则两个插件会同时工作，麦麦会复读两次。
 
 ## 配置
 
@@ -70,17 +66,6 @@ C：好好好
                                 └─► 下一次 planner 请求：extra_prompt 追加一次，立即消费
 ```
 
-三个设计要点：
-
-1. **为什么不会被分词器破坏**
-   "分词/分段"发生在 replyer 侧（planner 决策 → replyer 生成 → 分段器拆条）。插件用 `ctx.send.text` 走独立的发送通道，全程不经过这三个环节，文本原样单条发出，多长都一样。
-
-2. **为什么 planner 只注入一次**
-   planner 的默认动作就是 `no_reply`，且连续不动作会触发 `no_action_backoff`（15s→300s 递增退避）。若持续注入"不要再复读"这类抑制性提示，麦麦会明显变沉默、掉发言命中。所以只在复读后注入一次、立即消费。
-
-3. **不越权**
-   消息监听用 OBSERVE 只读旁路，不拦截、不修改任何消息；manifest 只声明 `send.text` 一个能力。
-
 ## 常见问题
 
 | 现象 | 排查 |
@@ -91,17 +76,6 @@ C：好好好
 | 过一阵再刷同一个梗不跟了 | `once.repeated_memory_ttl`（默认 5 分钟）太长，调小即可 |
 | 和其他复读 bot 互相复读 | 把对方 QQ 填进 `filter.ignored_user_ids` |
 | 首次部署想确认字段名 | 开 `debug.dump_message_structure`，首条消息会 dump 完整结构（只输出一次），确认后关掉 |
-
-## 开发
-
-跑自测（mock ctx，不依赖真实 MaiBot）：
-
-```bash
-cd "D:/workdoc/plugin"
-"C:/Users/octmicy/AppData/Local/Programs/Python/Python313/python.exe" Mai_repeater/tests/run_self_test.py
-```
-
-想用部署环境自带的 SDK 验证兼容性，加环境变量 `MAIBOT_SDK_PATH=""` 即可。
 
 ## 许可证
 
