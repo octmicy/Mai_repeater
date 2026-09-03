@@ -3,7 +3,7 @@
   "id": "mai_repeater",
   "name": "麦麦的本质就是复读机",
   "version": "1.0.0",
-  "description": "群聊复读插件：当群友复读时，插件会识别并直接通过sdk发送复读语录，防止分词器来自动断句，导致复读失败。"
+  "description": "群聊复读插件：当群友复读时，插件会识别并通过 SDK 直接发送复读内容，避免分词器自动断句导致复读失败。",
   "author": {
     "name": "octmicy",
     "url": "https://github.com/octmicy/Mai_repeater"
@@ -12,6 +12,7 @@
   "urls": {
     "repository": "https://github.com/octmicy/Mai_repeater",
     "homepage": "https://github.com/octmicy/Mai_repeater",
+    "documentation": "https://docs.mai-mai.org"
   },
   "host_application": {
     "min_version": "1.0.0",
