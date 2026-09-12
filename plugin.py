@@ -38,6 +38,24 @@ from .config import RepeaterSettings
 _PLANNER_NOTE_PREFIX = "\n[复读插件状态] "
 _MAX_NOTE_TEXT = 24
 
+# 非文本组件类型（主程序 message_component_data_model.py 的 format_name）：
+# 这些消息不参与复读判定——插件只能发文字，复读图片/表情包只会变成发占位文本
+_NON_TEXT_COMPONENT_TYPES = {
+    "image",
+    "emoji",
+    "voice",
+    "video",
+    "file",
+    "record",
+    "face",
+    "mface",
+    "forward",
+    "music",
+    "poke",
+    "xml",
+    "json",
+}
+
 
 class RepeaterPlugin(MaiBotPlugin):
     """麦麦复读机主类。
@@ -136,8 +154,56 @@ class RepeaterPlugin(MaiBotPlugin):
             self._vlog(f"[复读机] 发送人 {user_id} 被过滤，不参与判定")
             return None
 
+        excluded, reason = self._exclude_reason(msg, stripped)
+        if excluded:
+            self._vlog(f"[复读机] {reason}，不参与判定: {stream_id}")
+            return None
+
         self._handle_inbound(stream_id, user_id, text)
         return None
+
+    def _exclude_reason(self, msg: dict[str, Any], text: str) -> tuple[bool, str]:
+        """判断消息是否应排除在复读之外，返回 (是否排除, 原因)。
+
+        两道保险：
+        1. 组件类型：图片/表情/语音等非文本消息——插件只能发文字，
+           复读它们只会变成发一段占位文本，没有意义；
+        2. 关键词：MaiBot 会把表情包文本化成「[表情包：xxx]」，
+           这类占位文本即使是纯文本也要排除。
+        """
+        cfg = self.config.filter
+
+        if bool(cfg.exclude_non_text):
+            types = self._component_types(msg)
+            hit = types & _NON_TEXT_COMPONENT_TYPES
+            if hit:
+                return True, f"非文本消息（组件类型: {'/'.join(sorted(hit))}）"
+
+        keywords = [str(k).strip() for k in cfg.exclude_keywords if str(k).strip()]
+        if keywords:
+            lowered = text.casefold()
+            for kw in keywords:
+                if kw.casefold() in lowered:
+                    return True, f"命中排除关键词「{kw}」"
+        return False, ""
+
+    def _component_types(self, msg: dict[str, Any]) -> set[str]:
+        """提取消息的组件类型集合（兼容 type / format_name 两种序列化键）。"""
+        raw = msg.get("raw_message")
+        components: Any = None
+        if isinstance(raw, dict):
+            components = raw.get("components")
+        elif isinstance(raw, list):
+            components = raw
+        types: set[str] = set()
+        if isinstance(components, list):
+            for comp in components:
+                if not isinstance(comp, dict):
+                    continue
+                name = comp.get("type") or comp.get("format_name")
+                if name:
+                    types.add(str(name).strip().lower())
+        return types
 
     def _handle_inbound(self, stream_id: str, user_id: str, text: str) -> None:
         """记录消息并判定是否触发复读；命中则安排发送任务。"""

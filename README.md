@@ -18,7 +18,7 @@ C：好好好
 - **原样复读**：走 SDK 的 `send.text` 直发通道，不经过 planner / replyer / 分段器，长文本也不会被拆成多条气泡或被 LLM 改写
 - **同一句话只跟一次**：记忆期内同一段文本不会再复读，后续不管来几波都不跟
 - **不打扰 planner**：复读后只向 planner 注入**一次**状态提示（告诉它"我刚复读过"），不会持续压制麦麦的发言意愿
-- **防干扰**：命令消息、超长文本、指定机器人账号都不参与判定
+- **防干扰**：命令消息、超长文本、表情包/图片等非文本消息、指定机器人账号都不参与判定
 - **可自查**：`/rp_stat` 随时查看当前窗口、已复读记忆、守卫状态
 
 ## 安装
@@ -47,6 +47,8 @@ C：好好好
 | planner_guard | `pending_ttl` | `180` | 待注入提示的有效期（秒），超时作废 |
 | filter | `ignored_user_ids` | `[]` | 不参与判定的发送人（可填其他复读 bot 的 QQ） |
 | filter | `bot_user_ids` | `[]` | 麦麦自己的 ID（防御性过滤，通常不用填） |
+| filter | `exclude_non_text` | `true` | 图片/表情/语音/视频等非文本消息不参与复读 |
+| filter | `exclude_keywords` | `["表情包", "[图片]", …]` | 文本命中任一关键词不参与复读 |
 | debug | `dump_message_structure` | `false` | 首条消息 dump 完整结构，用于核对字段名 |
 | debug | `verbose_log` | `false` | 输出窗口计数等调试日志 |
 
@@ -75,6 +77,7 @@ C：好好好
 | 复读慢半拍 | `delay_min/delay_max` 默认 0.5~2 秒，故意的；想秒回设成 `0` |
 | 过一阵再刷同一个梗不跟了 | `once.repeated_memory_ttl`（默认 5 分钟）太长，调小即可 |
 | 和其他复读 bot 互相复读 | 把对方 QQ 填进 `filter.ignored_user_ids` |
+| 麦麦会不会复读表情包 | 不会：图片/表情等非文本消息默认排除，表情包文本占位「[表情包：xxx]」也被 `exclude_keywords` 拦下 |
 | 首次部署想确认字段名 | 开 `debug.dump_message_structure`，首条消息会 dump 完整结构（只输出一次），确认后关掉 |
 
 ## 许可证

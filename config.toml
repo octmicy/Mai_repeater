@@ -25,6 +25,10 @@ pending_ttl = 180.0
 [filter]
 ignored_user_ids = []
 bot_user_ids = []
+# 图片/表情/语音等非文本消息不参与复读（插件只能发文字，复读表情包没意义）
+exclude_non_text = true
+# 文本命中这些关键词不参与复读：MaiBot 会把表情包文本化成「[表情包：xxx]」
+exclude_keywords = ["表情包", "[图片]", "[动画表情]", "[语音]", "[视频]", "[文件]"]
 
 [debug]
 dump_message_structure = false

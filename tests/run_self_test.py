@@ -67,8 +67,8 @@ class FakeCtx:
 
 
 def make_plugin(overrides: dict[str, Any] | None = None) -> tuple[Any, FakeCtx]:
-    from repeater.config import RepeaterSettings
-    from repeater.plugin import RepeaterPlugin
+    from Mai_repeater.config import RepeaterSettings
+    from Mai_repeater.plugin import RepeaterPlugin
 
     cfg_data: dict[str, Any] = {
         "plugin": {"enabled": True},
@@ -85,7 +85,12 @@ def make_plugin(overrides: dict[str, Any] | None = None) -> tuple[Any, FakeCtx]:
         },
         "once": {"repeated_memory_ttl": 300.0},
         "planner_guard": {"enabled": True, "pending_ttl": 180.0},
-        "filter": {"ignored_user_ids": [], "bot_user_ids": []},
+        "filter": {
+            "ignored_user_ids": [],
+            "bot_user_ids": [],
+            "exclude_non_text": True,
+            "exclude_keywords": ["表情包", "[图片]", "[动画表情]", "[语音]", "[视频]", "[文件]"],
+        },
         "debug": {"dump_message_structure": False, "verbose_log": False},
     }
     if overrides:
@@ -104,6 +109,17 @@ def make_msg(stream: str, uid: str, text: str) -> dict[str, Any]:
         "message": {
             "message_info": {"user_info": {"user_id": uid}, "chat_id": stream},
             "processed_plain_text": text,
+        }
+    }
+
+
+def make_media_msg(stream: str, uid: str, comp_type: str, text: str = "") -> dict[str, Any]:
+    """构造带非文本组件的消息（如图片、表情包）。"""
+    return {
+        "message": {
+            "message_info": {"user_info": {"user_id": uid}, "chat_id": stream},
+            "processed_plain_text": text,
+            "raw_message": {"components": [{"type": comp_type, "data": "AAABAA=="}]},
         }
     }
 
@@ -195,6 +211,47 @@ async def case_filters() -> None:
     await feed(p, "s8", "u2", "别学我")
     await feed(p, "s8", "u3", "别学我")
     check(len(ctx.send.sent) == 0, "忽略名单内的发送人不计数不触发")
+
+
+async def case_exclude_media() -> None:
+    """表情包 / 非文本消息不参与复读。"""
+    # 1. 表情包文本占位（MaiBot 会把表情包文本化成「[表情包：xxx]」）
+    p, ctx = make_plugin()
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s20", uid, "[表情包：猫猫大笑]")
+    check(len(ctx.send.sent) == 0, "表情包文本占位不参与复读")
+
+    # 2. image 组件消息
+    p, ctx = make_plugin()
+    for uid in ("u1", "u2", "u3"):
+        await p.on_message(**make_media_msg("s21", uid, "image", "同一张图"))
+        await asyncio.sleep(0.02)
+    check(len(ctx.send.sent) == 0, "image 组件消息不参与复读")
+
+    # 3. emoji 组件消息
+    p, ctx = make_plugin()
+    for uid in ("u1", "u2", "u3"):
+        await p.on_message(**make_media_msg("s22", uid, "emoji", "同一个表情"))
+        await asyncio.sleep(0.02)
+    check(len(ctx.send.sent) == 0, "emoji 组件消息不参与复读")
+
+    # 4. 自定义排除关键词
+    p, ctx = make_plugin({"filter": {"exclude_keywords": ["不许复读"]}})
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s23", uid, "这句不许复读哦")
+    check(len(ctx.send.sent) == 0, "自定义排除关键词生效")
+
+    # 5. 关掉两道保险后恢复复读（证明是配置在起作用，而非硬编码）
+    p, ctx = make_plugin({"filter": {"exclude_non_text": False, "exclude_keywords": []}})
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s24", uid, "[表情包：猫猫大笑]")
+    check(len(ctx.send.sent) == 1, "关闭排除配置后照常复读")
+
+    # 6. 普通文本回归
+    p, ctx = make_plugin()
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s25", uid, "正常文字")
+    check(len(ctx.send.sent) == 1, "普通文本不受排除影响")
 
 
 async def case_normalize() -> None:
@@ -300,10 +357,10 @@ async def case_lifecycle() -> None:
 
 async def case_config_field_consistency() -> None:
     """静态校验：plugin.py 引用的配置字段必须在配置模型中存在（防字段改名残留）。"""
-    import repeater
-    from repeater.config import RepeaterSettings
+    import Mai_repeater
+    from Mai_repeater.config import RepeaterSettings
 
-    src = (pathlib.Path(repeater.__file__).parent / "plugin.py").read_text(encoding="utf-8")
+    src = (pathlib.Path(Mai_repeater.__file__).parent / "plugin.py").read_text(encoding="utf-8")
     sections = {
         name: set(info.annotation.model_fields.keys())
         for name, info in RepeaterSettings.model_fields.items()
@@ -328,6 +385,7 @@ async def main_async() -> None:
     await case_memory_ttl_expiry()
     await case_cooldown_blocks_other_text()
     await case_filters()
+    await case_exclude_media()
     await case_normalize()
     await case_planner_guard_once()
     await case_planner_guard_edge()
@@ -336,7 +394,7 @@ async def main_async() -> None:
     await case_config_field_consistency()
     await case_rp_stat()
 
-    from repeater.plugin import RepeaterPlugin, create_plugin
+    from Mai_repeater.plugin import RepeaterPlugin, create_plugin
 
     instance = create_plugin()
     check(isinstance(instance, RepeaterPlugin), "create_plugin() 工厂函数")

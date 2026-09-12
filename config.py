@@ -186,6 +186,22 @@ class FilterConfig(PluginConfigBase):
             "hint": "若某些环境下入站消息包含机器人自己的消息，填入其 user_id 以排除。",
         },
     )
+    exclude_non_text: bool = Field(
+        default=True,
+        description="图片/表情/语音/视频/文件等非文本消息不参与复读",
+        json_schema_extra={
+            "label": "排除非文本消息",
+            "hint": "按消息组件类型判定。插件只能发文字，复读表情包会变成发一段占位文本，所以默认排除。",
+        },
+    )
+    exclude_keywords: list[str] = Field(
+        default_factory=lambda: ["表情包", "[图片]", "[动画表情]", "[语音]", "[视频]", "[文件]"],
+        description="消息文本命中任一关键词时不参与复读",
+        json_schema_extra={
+            "label": "排除关键词",
+            "hint": "MaiBot 会把表情包消息文本化成「[表情包：xxx]」这类占位，默认已排除。留空表示不按关键词排除。",
+        },
+    )
 
 
 class DebugConfig(PluginConfigBase):
