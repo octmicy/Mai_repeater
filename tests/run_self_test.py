@@ -22,7 +22,7 @@ from typing import Any
 
 # 留空（MAIBOT_SDK_PATH=""）可让测试跑在当前解释器的 site-packages 版本上，
 # 用于验证部署环境自带的 SDK（如 MaiBotOneKeyDesktop 的 2.8.0）是否兼容
-SDK_PATH = os.environ.get("MAIBOT_SDK_PATH", r"D:\MaiBot\plugin\maibot-plugin-sdk-2.7.0")
+SDK_PATH = os.environ.get("MAIBOT_SDK_PATH", r"D:\MaiBot\plugin\maibot-plugin-sdk-2.8.1")
 PLUGIN_ROOT = r"D:\workdoc\plugin"
 
 for p in (SDK_PATH, PLUGIN_ROOT):
@@ -333,6 +333,83 @@ async def case_planner_guard_edge() -> None:
     check(not p._pending_note, "兜底注入后所有 pending 已消费")
 
 
+async def case_planner_guard_items() -> None:
+    """新版主程序（MaiBot 1.2.5+）的 Context Items 注入路径。"""
+
+    def make_items(*, with_system: bool = True) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        if with_system:
+            items.append(
+                {
+                    "item_type": "SystemMessageItem",
+                    "meta": {"item_id": "sys-1", "logical_turn_id": None, "timestamp": "2026-09-16T00:00:00+08:00"},
+                    "parts": [{"type": "text", "text": "原有的系统提示"}],
+                }
+            )
+        items.append(
+            {
+                "item_type": "UserMessageItem",
+                "meta": {"item_id": "u-1", "logical_turn_id": None, "timestamp": "2026-09-16T00:00:01+08:00"},
+                "parts": [{"type": "text", "text": "群友消息"}],
+            }
+        )
+        return items
+
+    def item_text(item: dict[str, Any]) -> str:
+        return "".join(
+            part.get("text", "")
+            for part in item.get("parts", [])
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+
+    # 1. 追加到已有 SystemMessageItem
+    p, ctx = make_plugin()
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s30", uid, "新版注入测试")
+    result = await p.guard_planner(
+        items=make_items(), item_schema_version=1, session_id="s30", tool_definitions=[]
+    )
+    mod = result["modified_kwargs"]
+    sys_text = item_text(mod["items"][0])
+    check("刚才跟风复读过一次" in sys_text, "新版：提示注入到 SystemMessageItem")
+    check("原有的系统提示" in sys_text, "新版：追加不覆盖原有 system 内容")
+    check(len(mod["items"]) == 2, "新版：追加到已有 system，不新增 item")
+    check("s30" not in p._pending_note, "新版：注入成功即消费")
+
+    # 2. 第二次请求不再注入
+    result2 = await p.guard_planner(items=make_items(), item_schema_version=1, session_id="s30")
+    check(
+        "刚才跟风复读过一次" not in item_text(result2["modified_kwargs"]["items"][0]),
+        "新版：只注入一次",
+    )
+
+    # 3. 没有 system item 时插入新 item（meta 必须合法，否则主程序反序列化抛错）
+    p, ctx = make_plugin()
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s31", uid, "无系统项场景")
+    result3 = await p.guard_planner(
+        items=make_items(with_system=False), item_schema_version=1, session_id="s31"
+    )
+    mod3 = result3["modified_kwargs"]
+    check(len(mod3["items"]) == 2, "无 system item 时插入一条新 item")
+    new_item = mod3["items"][0]
+    check(new_item.get("item_type") == "SystemMessageItem", "新 item 类型为 SystemMessageItem")
+    meta = new_item.get("meta") or {}
+    check(
+        bool(meta.get("item_id")) and "logical_turn_id" in meta and bool(meta.get("timestamp")),
+        "新 item 的 meta 含 item_id/logical_turn_id/timestamp",
+    )
+
+    # 4. 无可注入目标时不消费，补注入成功后才消费
+    p, ctx = make_plugin()
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s32", uid, "兜底不消费")
+    await p.guard_planner(task_name="planner")
+    check("s32" in p._pending_note, "既无 items 也无 extra_prompt 时不消费（保留待下次）")
+    await p.guard_planner(items=make_items(), item_schema_version=1, session_id="s32")
+    check("s32" not in p._pending_note, "补注入成功后消费")
+
+
 async def case_disabled() -> None:
     p, ctx = make_plugin({"plugin": {"enabled": False}})
     for uid in ("u1", "u2", "u3"):
@@ -389,6 +466,7 @@ async def main_async() -> None:
     await case_normalize()
     await case_planner_guard_once()
     await case_planner_guard_edge()
+    await case_planner_guard_items()
     await case_disabled()
     await case_lifecycle()
     await case_config_field_consistency()

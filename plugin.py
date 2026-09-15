@@ -28,7 +28,9 @@ import random
 import re
 import time
 from collections import deque
+from datetime import datetime
 from typing import Any, ClassVar, Iterable
+import uuid
 
 from maibot_sdk import Command, HookHandler, MaiBotPlugin
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
@@ -37,6 +39,11 @@ from .config import RepeaterSettings
 
 _PLANNER_NOTE_PREFIX = "\n[复读插件状态] "
 _MAX_NOTE_TEXT = 24
+
+# planner 提示的两种注入目标（主程序版本不同，插件同时兼容）
+# - 新版（MaiBot 1.2.5+ / SDK 2.8.x）：Context Items（kwargs["items"]）
+# - 旧版：extra_prompt 字符串
+_ITEM_SYSTEM = "SystemMessageItem"
 
 # 非文本组件类型（主程序 message_component_data_model.py 的 format_name）：
 # 这些消息不参与复读判定——插件只能发文字，复读图片/表情包只会变成发占位文本
@@ -317,38 +324,99 @@ class RepeaterPlugin(MaiBotPlugin):
         """planner 请求模型前注入状态提示（只注入一次）。
 
         设计依据（官方文档 + 主程序行为）：
-        - planner 的默认动作是 no_reply，且 HeartFChatting 有 no_action_backoff
-          （连续不动作就递增退避 15s→300s），持续注入抑制性提示会压低发言命中。
-        - 因此这里只在复读后最近的这一次 planner 请求里"告知事实"，
-          注入后立即消费掉，后续 planner 决策完全不受影响。
-        - extra_prompt 为 str，按追加语义注入（陷阱8：追加不覆盖其他插件内容）。
+        - planner 的默认动作是 no_reply，且连续不动作会触发 no_action_backoff
+          （15s→300s 递增退避），持续注入抑制性提示会压低发言命中；
+          因此只在复读后最近的一次 planner 请求里"告知事实"，注入即消费。
+
+        注入目标随主程序版本而变，插件两种都支持：
+        - MaiBot 1.2.5+ / SDK 2.8.x：kwargs 提供 `items`（Context Items），
+          把提示追加到最后一条 SystemMessageItem 的 parts；没有 system item
+          时在列表开头插入一条新的 SystemMessageItem；
+        - 旧版：kwargs 提供 `extra_prompt`（str），追加写入。
         """
         base = {"action": "continue", "modified_kwargs": kwargs}
         if not (self.config.plugin.enabled and self.config.planner_guard.enabled):
             return base
 
-        info = self._take_pending_note(kwargs)
-        if not info:
+        found = self._peek_pending_note(kwargs)
+        if not found:
             return base
+        stream_id, info = found
 
         note = (
             f"{_PLANNER_NOTE_PREFIX}你刚才跟风复读过一次「{self._preview(info.get('text', ''))}」"
             "（这是插件自动参与群友复读，不是你主动想说的），"
             "知道这件事就行，不用再重复这句话，按正常聊天继续。"
         )
-        kwargs["extra_prompt"] = (kwargs.get("extra_prompt") or "") + note
+
+        target = self._inject_note(kwargs, note)
+        if target is None:
+            self.ctx.logger.warning(
+                "[复读机] planner 请求既无 items 也无 extra_prompt，提示暂不注入（保留待下次请求）"
+            )
+            return base
+
+        # 注入成功才消费，确保"只注入一次"
+        self._pending_note.pop(stream_id, None)
         self.ctx.logger.info(
-            f"[复读机] 已向 planner 注入一次防复读提示（stream={info.get('stream_id', '')}），已消费"
+            f"[复读机] 已向 planner 注入一次防复读提示（目标={target}, stream={stream_id}），已消费"
         )
         return {"action": "continue", "modified_kwargs": kwargs}
 
-    def _take_pending_note(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
-        """取出待注入提示（取出即消费，保证只注入一次）。
+    def _inject_note(self, kwargs: dict[str, Any], note: str) -> str | None:
+        """把提示写入 planner 请求参数；返回注入目标描述，无法注入时返回 None。"""
+        items = kwargs.get("items")
+        if isinstance(items, list):
+            self._append_note_to_items(items, note)
+            return "items/SystemMessageItem"
+
+        if "extra_prompt" in kwargs:
+            kwargs["extra_prompt"] = (kwargs.get("extra_prompt") or "") + note
+            return "extra_prompt"
+        return None
+
+    @staticmethod
+    def _append_note_to_items(items: list[Any], note: str) -> None:
+        """把提示追加进 Context Items。
+
+        主程序 1.2.5 的 planner hook 载荷是 Context Item 快照，每条形如
+        {"item_type", "meta"{item_id, logical_turn_id, timestamp}, "parts"}。
+        优先追加到已有 SystemMessageItem 的 parts（不改消息顺序）；
+        没有 system item 时插入一条新的——item_id 必须唯一、timestamp 必须是
+        ISO 时间，否则主程序反序列化会抛错。
+        """
+        for item in reversed(items):
+            if isinstance(item, dict) and item.get("item_type") == _ITEM_SYSTEM:
+                parts = item.get("parts")
+                if not isinstance(parts, list):
+                    parts = []
+                    item["parts"] = parts
+                parts.append({"type": "text", "text": note})
+                return
+
+        items.insert(
+            0,
+            {
+                "item_type": _ITEM_SYSTEM,
+                "meta": {
+                    "item_id": f"mai-repeater-guard-{uuid.uuid4().hex}",
+                    "logical_turn_id": None,
+                    "timestamp": datetime.now().astimezone().isoformat(),
+                },
+                "parts": [{"type": "text", "text": note}],
+            },
+        )
+
+    def _peek_pending_note(self, kwargs: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        """查找待注入提示（只读不消费，注入成功后再由调用方 pop）。
 
         - 先丢弃超过 pending_ttl 的待注入提示（复读潮已过，注入陈旧信息无意义）；
-        - 会话匹配：依次尝试 kwargs 顶层与 reply_tool_args/reference_info 中的
-          会话键（stream_id/chat_id/session_id/chat_stream_id）；
+        - 会话匹配：优先 kwargs 顶层的 session_id（MaiBot 1.2.5 直接提供），
+          再回退旧版的 reply_tool_args / reference_info / tool_args；
         - 无法识别会话时退化为最近一条待注入提示（单活跃群场景下等价）。
+
+        Returns:
+            (stream_id, info) 元组；没有可注入的提示时返回 None。
         """
         ttl = max(0.0, float(self.config.planner_guard.pending_ttl))
         now = time.time()
@@ -382,9 +450,9 @@ class RepeaterPlugin(MaiBotPlugin):
         if stream_id is None:
             return None
 
-        info = dict(self._pending_note.pop(stream_id))
+        info = dict(self._pending_note[stream_id])
         info["stream_id"] = stream_id
-        return info
+        return stream_id, info
 
     def _stream_candidates(self, kwargs: dict[str, Any]) -> list[str]:
         """从 planner hook kwargs 中提取可能的会话标识。"""

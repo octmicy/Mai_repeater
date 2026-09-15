@@ -78,6 +78,7 @@ C：好好好
 | 过一阵再刷同一个梗不跟了 | `once.repeated_memory_ttl`（默认 5 分钟）太长，调小即可 |
 | 和其他复读 bot 互相复读 | 把对方 QQ 填进 `filter.ignored_user_ids` |
 | 麦麦会不会复读表情包 | 不会：图片/表情等非文本消息默认排除，表情包文本占位「[表情包：xxx]」也被 `exclude_keywords` 拦下 |
+| 麦麦升级后防复读提示还有效吗 | 有效。插件同时兼容两种 planner 契约：MaiBot 1.2.5+ 用 Context Items（注入到 SystemMessageItem），旧版用 extra_prompt；找不到注入目标时不消费提示，保留到下次请求 |
 | 首次部署想确认字段名 | 开 `debug.dump_message_structure`，首条消息会 dump 完整结构（只输出一次），确认后关掉 |
 
 ## 许可证
