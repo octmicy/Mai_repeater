@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import pathlib
@@ -22,7 +23,7 @@ from typing import Any
 
 # 留空（MAIBOT_SDK_PATH=""）可让测试跑在当前解释器的 site-packages 版本上，
 # 用于验证部署环境自带的 SDK（如 MaiBotOneKeyDesktop 的 2.8.0）是否兼容
-SDK_PATH = os.environ.get("MAIBOT_SDK_PATH", r"D:\MaiBot\plugin\maibot-plugin-sdk-2.8.1")
+SDK_PATH = os.environ.get("MAIBOT_SDK_PATH", r"D:\MaiBot\plugin\maibot-plugin-sdk-2.13.0")
 PLUGIN_ROOT = r"D:\workdoc\plugin"
 
 for p in (SDK_PATH, PLUGIN_ROOT):
@@ -60,13 +61,29 @@ class FakeSend:
         return self.result
 
 
+class FakeConfig:
+    """mock ctx.config：按点分路径返回主程序配置值。"""
+
+    def __init__(self, values: dict[str, Any] | None = None) -> None:
+        self.values = values or {}
+        self.calls: list[str] = []
+
+    async def get(self, key: str, default: Any = None) -> Any:
+        self.calls.append(key)
+        return self.values.get(key, default)
+
+
 class FakeCtx:
-    def __init__(self, send: FakeSend | None = None) -> None:
+    def __init__(self, send: FakeSend | None = None, config: FakeConfig | None = None) -> None:
         self.logger = FakeLogger()
         self.send = send or FakeSend()
+        self.config = config or FakeConfig()
 
 
-def make_plugin(overrides: dict[str, Any] | None = None) -> tuple[Any, FakeCtx]:
+def make_plugin(
+    overrides: dict[str, Any] | None = None,
+    bot_config: dict[str, Any] | None = None,
+) -> tuple[Any, FakeCtx]:
     from Mai_repeater.config import RepeaterSettings
     from Mai_repeater.plugin import RepeaterPlugin
 
@@ -88,6 +105,9 @@ def make_plugin(overrides: dict[str, Any] | None = None) -> tuple[Any, FakeCtx]:
         "filter": {
             "ignored_user_ids": [],
             "bot_user_ids": [],
+            "auto_exclude_self": True,
+            "exclude_bot_names": True,
+            "bot_names_extra": [],
             "exclude_non_text": True,
             "exclude_keywords": ["表情包", "[图片]", "[动画表情]", "[语音]", "[视频]", "[文件]"],
         },
@@ -98,7 +118,7 @@ def make_plugin(overrides: dict[str, Any] | None = None) -> tuple[Any, FakeCtx]:
             cfg_data.setdefault(section, {}).update(values)
 
     plugin = RepeaterPlugin()
-    ctx = FakeCtx()
+    ctx = FakeCtx(config=FakeConfig(bot_config))
     plugin._set_context(ctx)
     plugin._plugin_config_instance = RepeaterSettings(**cfg_data)
     return plugin, ctx
@@ -410,6 +430,96 @@ async def case_planner_guard_items() -> None:
     check("s32" not in p._pending_note, "补注入成功后消费")
 
 
+async def case_self_and_name_filter() -> None:
+    """功能①：不复读自己说的话；功能②：文本含机器人称呼时不复读。"""
+
+    # 1. 主程序配置里的机器人账号不参与计数
+    p, ctx = make_plugin(bot_config={"bot.qq_account": "10001", "bot.nickname": "麦麦"})
+    await p.on_load()
+    check("10001" in p._self_ids, "on_load 从 ctx.config 读到机器人账号")
+    check(p._bot_names == ["麦麦"], "on_load 从 ctx.config 读到机器人昵称")
+    await feed(p, "s40", "u1", "复读我")
+    await feed(p, "s40", "u2", "复读我")
+    await feed(p, "s40", "10001", "复读我")
+    check(len(ctx.send.sent) == 0, "机器人自己发的消息不计数（只剩 2 个真人，不触发）")
+
+    # 2. 消息自带账号标识与发送者相同 → 视为自己
+    p, ctx = make_plugin(bot_config={"bot.qq_account": "", "bot.nickname": "麦麦"})
+    await p.on_load()
+    await feed(p, "s41", "u1", "自己消息测试")
+    await feed(p, "s41", "u2", "自己消息测试")
+    self_msg = make_msg("s41", "u3", "自己消息测试")
+    self_msg["message"]["account_id"] = "u3"
+    await p.on_message(**self_msg)
+    await asyncio.sleep(0.02)
+    check(len(ctx.send.sent) == 0, "account_id 与发送者相同视为自己，不计数")
+
+    # 3. 文本含昵称 → 不复读
+    p, ctx = make_plugin(bot_config={"bot.nickname": "麦麦"})
+    await p.on_load()
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s42", uid, "麦麦快来复读")
+    check(len(ctx.send.sent) == 0, "文本含机器人昵称时不复读")
+
+    # 4. 别名与额外称呼
+    p, ctx = make_plugin(bot_config={"bot.nickname": "麦麦", "bot.alias_names": ["小麦"]})
+    await p.on_load()
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s43", uid, "小麦你说话")
+    check(len(ctx.send.sent) == 0, "文本含机器人别名时不复读")
+
+    p, ctx = make_plugin(
+        bot_config={"bot.nickname": "麦麦"},
+        overrides={"filter": {"bot_names_extra": ["麦子"]}},
+    )
+    await p.on_load()
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s44", uid, "麦子在这吗")
+    check(len(ctx.send.sent) == 0, "filter.bot_names_extra 额外称呼生效")
+
+    # 5. 关闭两个开关 → 恢复原行为
+    p, ctx = make_plugin(
+        bot_config={"bot.qq_account": "10001", "bot.nickname": "麦麦"},
+        overrides={"filter": {"auto_exclude_self": False, "exclude_bot_names": False}},
+    )
+    await p.on_load()
+    check(not p._self_ids and not p._bot_names, "关闭开关后不加载身份缓存")
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s45", uid, "麦麦复读我")
+    check(len(ctx.send.sent) == 1, "关闭开关后照常复读")
+
+    # 6. 普通文本回归
+    p, ctx = make_plugin(bot_config={"bot.nickname": "麦麦"})
+    await p.on_load()
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s46", uid, "普通聊天内容")
+    check(len(ctx.send.sent) == 1, "普通文本不受影响")
+
+
+async def case_manifest_capabilities() -> None:
+    """静态校验：plugin.py 用到的 ctx 能力都已在 manifest 的 capabilities 声明。
+
+    漏声明时主程序会拒绝该调用，插件"能加载但功能是摆设"（技能陷阱 8）。
+    """
+    import inspect
+
+    from Mai_repeater import plugin as plugin_mod
+
+    src = inspect.getsource(plugin_mod)
+    used = {
+        (cap, method)
+        for cap, method in re.findall(r"ctx\.(\w+)\.(\w+)", src)
+        if cap not in {"logger", "paths"}  # 非能力对象
+    }
+    manifest_path = pathlib.Path(inspect.getfile(plugin_mod)).parent / "_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    declared = set(manifest.get("capabilities") or [])
+
+    missing = sorted(f"{cap}.{method}" for cap, method in used if f"{cap}.{method}" not in declared)
+    check(not missing, f"plugin.py 用到的能力都已在 manifest 声明（缺失: {missing}）")
+    check(bool(declared), "manifest capabilities 非空")
+
+
 async def case_disabled() -> None:
     p, ctx = make_plugin({"plugin": {"enabled": False}})
     for uid in ("u1", "u2", "u3"):
@@ -467,9 +577,11 @@ async def main_async() -> None:
     await case_planner_guard_once()
     await case_planner_guard_edge()
     await case_planner_guard_items()
+    await case_self_and_name_filter()
     await case_disabled()
     await case_lifecycle()
     await case_config_field_consistency()
+    await case_manifest_capabilities()
     await case_rp_stat()
 
     from Mai_repeater.plugin import RepeaterPlugin, create_plugin

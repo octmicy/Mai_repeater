@@ -180,10 +180,36 @@ class FilterConfig(PluginConfigBase):
     )
     bot_user_ids: list[str] = Field(
         default_factory=list,
-        description="麦麦自己的 user_id 列表（防御性过滤，正常情况入站流不含自己）",
+        description="麦麦自己的 user_id 列表（手动补充，自动识别失败时用）",
         json_schema_extra={
-            "label": "机器人自身 ID",
-            "hint": "若某些环境下入站消息包含机器人自己的消息，填入其 user_id 以排除。",
+            "label": "机器人自身 ID（手动）",
+            "hint": "自动识别（默认开启）拿不到身份时，可在这里手动填麦麦的 QQ 号。",
+        },
+    )
+    auto_exclude_self: bool = Field(
+        default=True,
+        description="自动从主程序配置读取机器人账号，不复读自己发的消息",
+        json_schema_extra={
+            "label": "不复读自己说的",
+            "hint": "通过 ctx.config 读取 bot.qq_account / bot.platforms，并结合消息自带的账号标识判断。"
+            "适配器把机器人自己的消息回送时，这些消息不会参与复读计数。",
+        },
+    )
+    exclude_bot_names: bool = Field(
+        default=True,
+        description="复读文本中出现机器人昵称/别名时不复读",
+        json_schema_extra={
+            "label": "含自己名字不复读",
+            "hint": "通过 ctx.config 读取 bot.nickname 与 bot.alias_names。例如文本里有「麦麦」就不跟读，"
+            "避免复读出带自己名字的内容。",
+        },
+    )
+    bot_names_extra: list[str] = Field(
+        default_factory=list,
+        description="额外需要识别的机器人称呼（补充主程序别名）",
+        json_schema_extra={
+            "label": "额外称呼",
+            "hint": "主程序里没配的昵称可以在这里补充，命中即不复读。",
         },
     )
     exclude_non_text: bool = Field(

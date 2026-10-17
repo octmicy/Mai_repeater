@@ -25,6 +25,12 @@ pending_ttl = 180.0
 [filter]
 ignored_user_ids = []
 bot_user_ids = []
+# 不复读自己说的话：从主程序配置读取 bot 账号（qq_account/platforms），并识别消息自带账号标识
+auto_exclude_self = true
+# 复读文本中出现机器人昵称/别名时不跟读（读取 bot.nickname / bot.alias_names）
+exclude_bot_names = true
+# 额外补充的机器人称呼（主程序里没配的昵称填这里）
+bot_names_extra = []
 # 图片/表情/语音等非文本消息不参与复读（插件只能发文字，复读表情包没意义）
 exclude_non_text = true
 # 文本命中这些关键词不参与复读：MaiBot 会把表情包文本化成「[表情包：xxx]」

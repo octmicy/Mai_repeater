@@ -47,6 +47,12 @@ C：好好好
 | planner_guard | `pending_ttl` | `180` | 待注入提示的有效期（秒），超时作废 |
 | filter | `ignored_user_ids` | `[]` | 不参与判定的发送人（可填其他复读 bot 的 QQ） |
 | filter | `bot_user_ids` | `[]` | 麦麦自己的 ID（防御性过滤，通常不用填） |
+| filter | `auto_exclude_self` | `true` | 不复读自己说的话（读 `bot.qq_account`/`bot.platforms` + 消息自带账号标识） |
+| filter | `exclude_bot_names` | `true` | 文本含机器人昵称/别名时不复读（读 `bot.nickname`/`bot.alias_names`） |
+| filter | `bot_names_extra` | `[]` | 额外补充的机器人称呼 |
+| filter | `auto_exclude_self` | `true` | 不复读自己说的话（读 `bot.qq_account`/`bot.platforms` + 消息自带账号标识） |
+| filter | `exclude_bot_names` | `true` | 文本含机器人昵称/别名时不复读（读 `bot.nickname`/`bot.alias_names`） |
+| filter | `bot_names_extra` | `[]` | 额外补充的机器人称呼 |
 | filter | `exclude_non_text` | `true` | 图片/表情/语音/视频等非文本消息不参与复读 |
 | filter | `exclude_keywords` | `["表情包", "[图片]", …]` | 文本命中任一关键词不参与复读 |
 | debug | `dump_message_structure` | `false` | 首条消息 dump 完整结构，用于核对字段名 |
@@ -78,6 +84,10 @@ C：好好好
 | 过一阵再刷同一个梗不跟了 | `once.repeated_memory_ttl`（默认 5 分钟）太长，调小即可 |
 | 和其他复读 bot 互相复读 | 把对方 QQ 填进 `filter.ignored_user_ids` |
 | 麦麦会不会复读表情包 | 不会：图片/表情等非文本消息默认排除，表情包文本占位「[表情包：xxx]」也被 `exclude_keywords` 拦下 |
+| 麦麦会不会复读自己说的话 | 不会。启动时从主程序配置读取机器人账号，发送者命中即跳过；适配器回送自己消息时（`account_id` 与发送者相同）同样识别 |
+| 复读内容里出现「麦麦」会怎样 | 不会复读。文本命中机器人昵称/别名（含 `bot_names_extra` 补充项）直接跳过 |
+| 麦麦会不会复读自己说的话 | 不会。启动时从主程序配置读取机器人账号，发送者命中即跳过；适配器回送自己消息时（`account_id` 与发送者相同）同样识别 |
+| 复读内容里出现「麦麦」会怎样 | 不会复读。文本命中机器人昵称/别名（含 `bot_names_extra` 补充项）直接跳过 |
 | 麦麦升级后防复读提示还有效吗 | 有效。插件同时兼容两种 planner 契约：MaiBot 1.2.5+ 用 Context Items（注入到 SystemMessageItem），旧版用 extra_prompt；找不到注入目标时不消费提示，保留到下次请求 |
 | 首次部署想确认字段名 | 开 `debug.dump_message_structure`，首条消息会 dump 完整结构（只输出一次），确认后关掉 |
 

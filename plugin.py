@@ -77,8 +77,8 @@ class RepeaterPlugin(MaiBotPlugin):
 
     config_model = RepeaterSettings
 
-    # 仅订阅自身配置热更新；不订阅主程序 bot/model scope
-    config_reload_subscriptions: ClassVar[Iterable[str]] = ()
+    # 自身配置热更新 + 订阅主程序 bot 配置（昵称/别名/账号变化时刷新身份缓存）
+    config_reload_subscriptions: ClassVar[Iterable[str]] = ("bot",)
 
     def __init__(self) -> None:
         super().__init__()
@@ -88,11 +88,15 @@ class RepeaterPlugin(MaiBotPlugin):
         self._pending_note: dict[str, dict[str, Any]] = {}
         self._cooldown_until: dict[str, float] = {}
         self._structure_dumped = False
+        # 机器人自身身份（由 ctx.config 读取，见 _refresh_identity）
+        self._self_ids: set[str] = set()
+        self._bot_names: list[str] = []
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
     async def on_load(self) -> None:
-        """初始化插件：打印生效配置摘要。"""
+        """初始化插件：读取自身身份，打印生效配置摘要。"""
+        await self._refresh_identity()
         c = self.config
         self.ctx.logger.info(
             f"[复读机] 已加载: 阈值={c.repeat.min_count}条/{c.repeat.min_senders}人, "
@@ -102,6 +106,10 @@ class RepeaterPlugin(MaiBotPlugin):
             f"（只注入一次, 提示有效期{c.planner_guard.pending_ttl}s）, "
             f"延迟={c.repeat.delay_min}~{c.repeat.delay_max}s"
         )
+        self.ctx.logger.info(
+            f"[复读机] 自身身份: 账号={sorted(self._self_ids) or '(无)'}, "
+            f"称呼={self._bot_names or '(无)'}"
+        )
 
     async def on_unload(self) -> None:
         """卸载插件。"""
@@ -110,7 +118,7 @@ class RepeaterPlugin(MaiBotPlugin):
     async def on_config_update(
         self, scope: str, config_data: dict[str, Any], version: str
     ) -> None:
-        """配置热更新（scope="self"）。"""
+        """配置热更新（self=插件自身配置；bot=主程序机器人配置）。"""
         del config_data
         if scope == "self":
             c = self.config
@@ -118,7 +126,63 @@ class RepeaterPlugin(MaiBotPlugin):
                 f"[复读机] 配置已热更新: 阈值={c.repeat.min_count}条/{c.repeat.min_senders}人, "
                 f"planner守卫={'开' if c.planner_guard.enabled else '关'}"
             )
+        elif scope == "bot":
+            # 昵称/别名/账号变了，重新加载自身身份
+            await self._refresh_identity()
+            self.ctx.logger.info(
+                f"[复读机] 机器人配置已更新，身份缓存刷新: "
+                f"账号={sorted(self._self_ids) or '(无)'}, 称呼={self._bot_names or '(无)'}"
+            )
         return None
+
+    async def _refresh_identity(self) -> None:
+        """从主程序配置读取机器人自身账号与称呼（SDK 官方 ctx.config 能力）。
+
+        读取项：
+        - bot.qq_account / bot.platforms：机器人账号（platforms 形如 "qq:123456"）
+        - bot.nickname / bot.alias_names：机器人昵称与别名
+        读取失败只告警，不影响复读主流程。
+        """
+        cfg = self.config.filter
+        if not (cfg.auto_exclude_self or cfg.exclude_bot_names):
+            self._self_ids, self._bot_names = set(), []
+            return
+
+        ids: set[str] = set(str(u).strip() for u in cfg.bot_user_ids if str(u).strip())
+        names: list[str] = []
+
+        try:
+            qq_account = await self.ctx.config.get("bot.qq_account", "")
+            if isinstance(qq_account, str) and qq_account.strip() not in ("", "0"):
+                ids.add(qq_account.strip())
+
+            platforms = await self.ctx.config.get("bot.platforms", [])
+            if isinstance(platforms, list):
+                for entry in platforms:
+                    text = str(entry or "").strip()
+                    if ":" in text:
+                        account = text.split(":", 1)[1].strip()
+                        if account:
+                            ids.add(account)
+        except Exception as exc:
+            self.ctx.logger.warning(f"[复读机] 读取机器人账号失败（不影响复读）: {exc}")
+
+        try:
+            nickname = await self.ctx.config.get("bot.nickname", "")
+            if isinstance(nickname, str) and nickname.strip():
+                names.append(nickname.strip())
+
+            aliases = await self.ctx.config.get("bot.alias_names", [])
+            if isinstance(aliases, list):
+                names.extend(str(a).strip() for a in aliases if str(a).strip())
+        except Exception as exc:
+            self.ctx.logger.warning(f"[复读机] 读取机器人昵称失败（不影响复读）: {exc}")
+
+        names.extend(str(n).strip() for n in cfg.bot_names_extra if str(n).strip())
+
+        # 去重并去掉空串，保持稳定顺序
+        self._self_ids = ids
+        self._bot_names = list(dict.fromkeys(names))
 
     # ── Hook 1: 入站消息检测（OBSERVE 只读旁路） ───────────────────────
 
@@ -156,9 +220,19 @@ class RepeaterPlugin(MaiBotPlugin):
             return None
 
         ignored = {str(u) for u in self.config.filter.ignored_user_ids if str(u).strip()}
-        bots = {str(u) for u in self.config.filter.bot_user_ids if str(u).strip()}
-        if user_id in ignored or user_id in bots:
-            self._vlog(f"[复读机] 发送人 {user_id} 被过滤，不参与判定")
+        if user_id in ignored:
+            self._vlog(f"[复读机] 发送人 {user_id} 在忽略名单，不参与判定")
+            return None
+
+        # 功能①：不复读自己说的话
+        if self.config.filter.auto_exclude_self and self._is_self_message(msg, user_id):
+            self._vlog(f"[复读机] 消息来自机器人自身（user_id={user_id}），不参与判定")
+            return None
+
+        # 功能②：文本里出现机器人昵称/别名，不跟读
+        hit_name = self._match_bot_name(stripped)
+        if hit_name:
+            self._vlog(f"[复读机] 文本含机器人称呼「{hit_name}」，不参与判定")
             return None
 
         excluded, reason = self._exclude_reason(msg, stripped)
@@ -167,6 +241,43 @@ class RepeaterPlugin(MaiBotPlugin):
             return None
 
         self._handle_inbound(stream_id, user_id, text)
+        return None
+
+    def _is_self_message(self, msg: dict[str, Any], user_id: str) -> bool:
+        """判断这条消息是不是机器人自己发出的。
+
+        两个依据，命中任一即认定为自己：
+        1. 发送者命中已知机器人账号——手动配置 `filter.bot_user_ids`，
+           或 on_load 时从 `ctx.config` 读到的 `bot.qq_account` / `bot.platforms`；
+        2. 消息自带的账号标识（`account_id` / `self_id` / `bot_id`）与发送者相同
+           —— 适配器把机器人自己的消息回送时这两个值会相等。
+        """
+        if not user_id:
+            return False
+
+        manual = {str(u).strip() for u in self.config.filter.bot_user_ids if str(u).strip()}
+        if user_id in manual or user_id in self._self_ids:
+            return True
+
+        for key in ("account_id", "self_id", "bot_id"):
+            val = msg.get(key)
+            if val and str(val).strip() == user_id:
+                return True
+        return False
+
+    def _match_bot_name(self, text: str) -> str | None:
+        """文本中出现机器人昵称/别名时返回命中的称呼，否则 None。
+
+        称呼来源：`ctx.config` 的 `bot.nickname` / `bot.alias_names`
+        + 插件配置 `filter.bot_names_extra`。
+        """
+        cfg = self.config.filter
+        if not cfg.exclude_bot_names or not self._bot_names:
+            return None
+        lowered = text.casefold()
+        for name in self._bot_names:
+            if name and name.casefold() in lowered:
+                return name
         return None
 
     def _exclude_reason(self, msg: dict[str, Any], text: str) -> tuple[bool, str]:
