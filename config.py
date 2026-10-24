@@ -269,7 +269,7 @@ class QQFaceConfig(PluginConfigBase):
         description="发送真实QQ表情（face 消息段）。仅适配 snowluma-adapter",
         json_schema_extra={
             "label": "发送真实QQ表情（仅 snowluma-adapter）",
-            "hint": "⚠️ 仅适配 snowluma-adapter：开启后通过 face 消息段发送真实QQ表情，发送失败会自动降级为文本；"
+            "hint": "⚠️ 仅适配 snowluma-adapter：开启后通过 face 消息段发送真实QQ表情，发送失败直接放弃本次跟发（不会改发文字）；"
             "使用其他适配器请关闭本项，将以 [微笑] 文本形式复读。",
         },
     )

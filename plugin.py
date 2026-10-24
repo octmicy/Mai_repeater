@@ -596,28 +596,35 @@ class RepeaterPlugin(MaiBotPlugin):
         """按内容种类选择发送通道；返回是否发送成功。
 
         - text: ctx.send.text 原样单条；
-        - sticker: ctx.send.emoji 回发缓存中的同一张图（纯 base64）；
+        - sticker: ctx.send.emoji 回发缓存中的同一张图（纯 base64），
+          失败直接放弃（不改发文字）；
         - face: ctx.send.custom("face", id) 发送真实QQ表情（依赖 snowluma-adapter），
-          发送失败自动降级为文本复读。
+          失败直接放弃（不改发文字）。send_native 关闭时按文本复读属用户主动选择。
         """
         if kind == _KIND_STICKER:
             cached = self._sticker_cache.get(key)
             if not cached or not cached[1]:
                 self.ctx.logger.warning("[复读机] 表情包图片数据已不在缓存中（过期或被挤出），放弃跟发")
                 return False
-            return bool(await self.ctx.send.emoji(cached[1], stream_id))
+            ok = bool(await self.ctx.send.emoji(cached[1], stream_id))
+            if not ok:
+                self.ctx.logger.warning("[复读机] send.emoji 未成功，本次不跟发")
+            return ok
 
         if kind == _KIND_FACE:
             payload_data = payload if isinstance(payload, dict) else {}
             face_id = str(payload_data.get("id") or "")
-            fallback_text = str(payload_data.get("text") or f"[{key}]")
-            if self.config.qq_face.send_native and face_id:
+            if not face_id:
+                return False
+            if self.config.qq_face.send_native:
                 ok = bool(await self.ctx.send.custom("face", face_id, stream_id))
-                if ok:
-                    return True
-                self.ctx.logger.warning(
-                    "[复读机] send.custom(face) 未成功（可能适配器不支持 face 段），降级为文本复读"
-                )
+                if not ok:
+                    self.ctx.logger.warning(
+                        "[复读机] send.custom(face) 未成功（可能适配器不支持 face 段），本次不跟发"
+                    )
+                return ok
+            # 用户主动关闭原生发送：按文本复读（非失败降级）
+            fallback_text = str(payload_data.get("text") or f"[{key}]")
             return bool(await self.ctx.send.text(text=fallback_text, stream_id=stream_id))
 
         return bool(await self.ctx.send.text(text=str(payload or ""), stream_id=stream_id))

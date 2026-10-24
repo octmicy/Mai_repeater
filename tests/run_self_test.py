@@ -688,6 +688,15 @@ async def case_sticker_gates() -> None:
         await asyncio.sleep(0.02)
     check(len(ctx.send.sent) == 0, "文字+表情混合消息不触发复读")
 
+    # send.emoji 发送失败 → 直接不跟发，不做文字降级
+    p, ctx = make_plugin()
+    ctx.send.result = False
+    for uid in ("u1", "u2", "u3"):
+        await feed_emoji(p, "s54", uid, "hashFAIL")
+    check(len([s for s in ctx.send.sent if "emoji" in s]) == 1, "send.emoji 失败前确实尝试过发送")
+    check(len([s for s in ctx.send.sent if "text" in s]) == 0, "send.emoji 失败后直接不跟发（无文字降级）")
+    check("s54" not in p._pending_note, "发送失败不向 planner 注入提示")
+
 
 async def case_face_repeat() -> None:
     """QQ原生表情复读：映射表反查 + send.custom(face) + 失败降级 + 开关。"""
@@ -705,14 +714,14 @@ async def case_face_repeat() -> None:
     check(custom_sends[0]["custom_type"] == "face", "通过 send.custom 发送 face 段")
     check(custom_sends[0]["data"] == face_id, "face_id 来自内置映射表")
 
-    # 2. 原生发送失败（适配器不支持）→ 自动降级为文本复读
+    # 2. 原生发送失败（适配器不支持）→ 直接不跟发，不做文字降级
     p, ctx = make_plugin()
     ctx.send.custom_result = False
     for uid in ("u1", "u2", "u3"):
         await feed(p, "s61", uid, "[微笑]")
-    text_sends = [s for s in ctx.send.sent if "text" in s]
-    check(len(text_sends) == 1, "send.custom 失败后降级发送一次")
-    check(text_sends[0].get("text") == "[微笑]", "降级发送文本为原表情占位文本")
+    check(len([s for s in ctx.send.sent if "custom_type" in s]) == 1, "失败前确实尝试过 face 段发送")
+    check(len([s for s in ctx.send.sent if "text" in s]) == 0, "send.custom 失败后直接不跟发（无文字降级）")
+    check("s61" not in p._pending_note, "发送失败不向 planner 注入提示")
 
     # 3. send_native=False → 直接文本复读
     p, ctx = make_plugin({"qq_face": {"send_native": False}})

@@ -1,7 +1,7 @@
 # 交接文档 — 麦麦的本质就是复读机（Mai_repeater）
 
 > 写给接手的人（也包括未来的自己 / 下一个 AI 会话）。
-> 最后更新：2026-10-24 ｜ 当前版本 **v1.4.0**
+> 最后更新：2026-10-24 ｜ 当前版本 **v1.4.1**
 
 ---
 
@@ -96,7 +96,7 @@ OBSERVE = 只读，**不拦截、不修改任何消息**（这是"不越权"的�
 text    → await self.ctx.send.text(text=原文, stream_id=stream_id)
 sticker → await self.ctx.send.emoji(缓存base64, stream_id=stream_id)
 face    → await self.ctx.send.custom("face", face_id, stream_id=stream_id)
-          失败自动降级 send.text("[微笑]")
+          失败直接不跟发（不降级文本；send_native 关闭时的文本复读是用户主动选择）
 ```
 
 **为什么用直发而不是让 planner 说**：分段/改写发生在 replyer 侧（planner 决策 → replyer 生成 → 分段器拆条）。`ctx.send.*` 是独立发送通道，全程不过这三个环节，所以内容原样、单条、多长都一样。
@@ -154,7 +154,7 @@ SDK **没有** `emoji.get_by_hash` 这类按内容回查图片的能力，触发
 - QQ 小黄脸入站时被适配器**文本化**成 `[微笑]`（face_id 丢失），核心组件模型里根本没有 face 组件
 - 出站通路：`ctx.send.custom("face", id)` → Host 兜底成 `DictComponent({"type":"face","data":id})` → snowluma-adapter 的 dict 解包器还原成 OneBot face 段（**这段解包逻辑是 snowluma 特有的**）
 - 映射表 `qq_face_data.py`（503 项）生成自 snowluma-adapter 的 `qq_face_map.py`（koishi QFace，2026-09-28 同步），规则与其出站编码器一致（十进制 id、同名取首个）——适配器更新后需重新生成
-- 三重保护：`send.custom` 失败自动降级文本复读；`on_load` 探测不到 snowluma-adapter 时告警提醒；配置开关 `qq_face.send_native` 可整体关掉
+- 保护措施（v1.4.1 起失败**不做文字降级**，直接不跟发）：`send.custom` 失败放弃本次；`on_load` 探测不到 snowluma-adapter 时告警提醒；配置开关 `qq_face.send_native` 可整体关掉（关闭后按文本复读属用户主动选择）
 - 误报边界：用户手打的 `[微笑]` 字面文本也会被当成表情复读（概率低、语义一致，README 已注明）
 
 ## 7. 配置项全表
@@ -183,7 +183,7 @@ SDK **没有** `emoji.get_by_hash` 这类按内容回查图片的能力，触发
 | filter | `exclude_keywords` | `["表情包","[表情]","[图片]",…]` | 文字通道命中即跳过 |
 | sticker | `enabled` | `true` | **表情包复读开关**（WebUI 按钮） |
 | qq_face | `enabled` | `true` | **QQ原生表情复读开关**（WebUI 按钮） |
-| qq_face | `send_native` | `true` | ⚠️ 发送真实QQ表情，**仅适配 snowluma-adapter**（WebUI 按钮带提示，失败自动降级文本） |
+| qq_face | `send_native` | `true` | ⚠️ 发送真实QQ表情，**仅适配 snowluma-adapter**（WebUI 按钮带提示，失败直接不跟发；关闭后按文本复读） |
 | debug | `dump_message_structure` | `false` | 首条消息 dump 完整结构（排查字段名用） |
 | debug | `verbose_log` | `false` | 窗口计数等冗余日志 |
 
@@ -263,7 +263,7 @@ git show v1.4.0:_manifest.json | head -6
 ## 12. 已知问题与可改进方向
 
 - `filter.bot_user_ids` 与 `auto_exclude_self` 有重叠：自动识别拿到账号后仍会合并手动列表，符合预期但配置项略显冗余
-- QQ原生表情复读的 face 段出站解包依赖 snowluma-adapter（`DictComponent` 兜底通道）；其他适配器上发送失败会降级文本，但"发送成功但显示异常"的适配器无法识别——已有 `on_load` 探测告警兜底
+- QQ原生表情复读的 face 段出站解包依赖 snowluma-adapter（`DictComponent` 兜底通道）；其他适配器上发送失败会直接不跟发（v1.4.1 起不做文字降级），但"发送成功但显示异常"的适配器无法识别——已有 `on_load` 探测告警兜底
 - 复读判定用的是精确匹配，没有做"近似复读"（比如多了个标点）识别；表情包按字节 hash 判定，同图不同压缩版本会被视为两张
 - 文字+表情混合消息（如"哈哈[表情包]"）不参与复读（分类器直接排除），未来可考虑 hybrid 发送
 - `+1.jpg`（图标原始素材）目前也在仓库里，如果不想保留可以从版本控制移除（`assets/icon.jpg` 才是实际使用的）
@@ -276,7 +276,8 @@ git show v1.4.0:_manifest.json | head -6
 | v1.1.0 | 排除表情包等非文本消息（关键词 + 组件类型双保险） |
 | v1.2.0 | 适配 MaiBot 1.2.5 的 planner Context Items 契约（原 `extra_prompt` 失效） |
 | v1.3.0 | 不复读自己说的话；复读文本含机器人称呼时不复读；manifest 补 display 图标 / plugin_type=extension / max_version=1.4.99 |
-| v1.4.0 | 表情包复读（send.emoji + hash 判定 + 内存缓存上限 16 条/24MB）与 QQ原生表情复读（send.custom face 段 + 内置映射表 503 项，仅适配 snowluma-adapter，失败降级文本、加载时探测告警）；消息分类重构为 text/sticker/face 三通道；两个新功能均为 WebUI 可开关配置项 |
+| v1.4.0 | 表情包复读（send.emoji + hash 判定 + 内存缓存上限 16 条/24MB）与 QQ原生表情复读（send.custom face 段 + 内置映射表 503 项，仅适配 snowluma-adapter，加载时探测告警）；消息分类重构为 text/sticker/face 三通道；两个新功能均为 WebUI 可开关配置项 |
+| v1.4.1 | 表情包/QQ表情发送失败时直接放弃本次跟发，移除文字降级（send_native 关闭时的文本复读保留，属用户主动选择） |
 
 ## 14. 相关资源
 

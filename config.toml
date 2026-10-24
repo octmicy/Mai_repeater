@@ -45,7 +45,7 @@ enabled = true
 # QQ原生表情复读：群友复读同一个QQ小黄脸时跟发同款
 enabled = true
 # 发送真实QQ表情（face 消息段）——⚠️ 仅适配 snowluma-adapter：
-# 其他适配器会自动降级为文本复读（发出 [微笑] 字面文本），不需要可关闭
+# 其他适配器可能发送失败（失败时直接不跟发，不会改发文字）；关闭本项则以 [微笑] 文本形式复读
 send_native = true
 
 [debug]
