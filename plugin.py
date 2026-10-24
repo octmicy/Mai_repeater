@@ -12,7 +12,7 @@
   同一张图。图片 base64 在内存中有数量/字节双上限缓存，自动过期清理。
 - QQ原生表情复读（v1.4.0）：QQ 小黄脸在入站时被适配器文本化成「[微笑]」，
   按内置映射表反查表情 id 后用 `ctx.send.custom("face", id)` 跟发真实
-  QQ 表情（仅适配 snowluma-adapter，发送失败自动降级为文本复读）。
+  QQ 表情（仅适配 snowluma-adapter，发送失败直接不跟发）。
 - 一次复读记忆（需求1）：同一内容在记忆 TTL（默认 5 分钟）内只复读一次，
   之后无论同一段内容再来几波，都不再跟。
 - planner 防复读守卫（需求2）：订阅 `maisaka.planner.before_request`，
@@ -222,7 +222,7 @@ class RepeaterPlugin(MaiBotPlugin):
         """QQ原生表情复读的适配器探测（提醒用户，不做硬性拦截）。
 
         真实 QQ 表情通过 face 消息段发送，依赖 snowluma-adapter 的 dict 组件
-        解包逻辑；其他适配器可能不支持。发送失败时插件会自动降级为文本复读，
+        解包逻辑；其他适配器可能不支持。发送失败时插件直接放弃本次跟发（不降级为文本复读），
         但这里仍在加载时主动探测并提示，让用户提前知晓。
         """
         if not self.config.qq_face.enabled:
@@ -243,7 +243,7 @@ class RepeaterPlugin(MaiBotPlugin):
         if not found:
             self.ctx.logger.warning(
                 f"[复读机] 未检测到 {_SNOWLUMA_ADAPTER_ID}：QQ原生表情复读发送真实表情仅适配 "
-                "snowluma-adapter，其他适配器将自动降级为文本复读；如不需要可关闭该功能"
+                "snowluma-adapter，其他适配器可能无法发送（失败将直接不跟发）；如不需要可关闭该功能"
             )
 
     # ── Hook 1: 入站消息检测（OBSERVE 只读旁路） ───────────────────────
