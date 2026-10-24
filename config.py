@@ -151,7 +151,7 @@ class PlannerGuardConfig(PluginConfigBase):
         description="复读后向 planner 注入一次状态提示，防止其自主决定再次复读",
         json_schema_extra={
             "label": "启用 planner 守卫",
-            "hint": "通过 maisaka.planner.before_request 的 extra_prompt 追加（官方注入点，不覆盖其他插件内容）。只注入一次——planner 默认动作是 no_reply，持续注入抑制性提示会压低发言命中。",
+            "hint": "通过 maisaka.planner.before_request 注入：MaiBot 1.2.5+ 走 Context Items（追加 SystemMessageItem），旧版走 extra_prompt。只注入一次——planner 默认动作是 no_reply，持续注入抑制性提示会压低发言命中。",
         },
     )
     pending_ttl: float = Field(
