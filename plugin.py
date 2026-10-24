@@ -2,13 +2,19 @@
 
 功能：
 - 复读检测：`chat.receive.after_process` OBSERVE 只读旁路监听入站消息，
-  每个会话维护滑动窗口；窗口内同一文本（归一化后）达到 min_count 条
+  每个会话维护滑动窗口；窗口内同一内容（归一化后）达到 min_count 条
   且来自 min_senders 个不同发送人，即判定群友在复读。
 - 跟风复读：通过 `ctx.send.text` 直发通道发送相同文字（原样、单条），
   不经过 planner/replyer/表达方式分段器——长文本不会被拆分或改写，
   从根本上规避"自动分词导致复读失败"的问题。
-- 一次复读记忆（需求1）：同一句话在记忆 TTL（默认 5 分钟）内只复读一次，
-  之后无论同一段文本再来几波，都不再跟。
+- 表情包复读（v1.4.0）：纯表情消息（单条仅一个 emoji 组件）按图片内容
+  指纹（SHA256 hash）判定同款，命中复读潮后用 `ctx.send.emoji` 原样跟发
+  同一张图。图片 base64 在内存中有数量/字节双上限缓存，自动过期清理。
+- QQ原生表情复读（v1.4.0）：QQ 小黄脸在入站时被适配器文本化成「[微笑]」，
+  按内置映射表反查表情 id 后用 `ctx.send.custom("face", id)` 跟发真实
+  QQ 表情（仅适配 snowluma-adapter，发送失败自动降级为文本复读）。
+- 一次复读记忆（需求1）：同一内容在记忆 TTL（默认 5 分钟）内只复读一次，
+  之后无论同一段内容再来几波，都不再跟。
 - planner 防复读守卫（需求2）：订阅 `maisaka.planner.before_request`，
   复读后只向 extra_prompt **追加一次**状态提示即消费掉，让 planner 知道
   "我刚复读过"，又不持续干扰其发言决策——planner 默认动作是 no_reply，
@@ -16,7 +22,7 @@
 
 边界（不越权）：
 - 消息监听为 OBSERVE 只读旁路，不拦截、不修改任何入站消息。
-- 发送仅使用官方 ctx.send.text 能力（manifest 只声明 send.text）。
+- 发送仅使用官方 ctx.send.* 能力（manifest 逐项声明）。
 - planner 提示使用官方 extra_prompt 追加语义（陷阱8：追加不覆盖）。
 """
 
@@ -36,6 +42,7 @@ from maibot_sdk import Command, HookHandler, MaiBotPlugin
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 from .config import RepeaterSettings
+from .qq_face_data import QQ_FACE_IDS_BY_NAME
 
 _PLANNER_NOTE_PREFIX = "\n[复读插件状态] "
 _MAX_NOTE_TEXT = 24
@@ -46,7 +53,9 @@ _MAX_NOTE_TEXT = 24
 _ITEM_SYSTEM = "SystemMessageItem"
 
 # 非文本组件类型（主程序 message_component_data_model.py 的 format_name）：
-# 这些消息不参与复读判定——插件只能发文字，复读图片/表情包只会变成发占位文本
+# 纯文本消息里混入这些组件时不参与文字复读——复读它们只会变成发占位文本。
+# 注意：emoji（纯表情消息）与 face 文本（QQ表情）在 v1.4.0 起有独立复读通道，
+# 会先于该排除被分类器接管；此集合用于文字通道的防御性排除。
 _NON_TEXT_COMPONENT_TYPES = {
     "image",
     "emoji",
@@ -63,13 +72,31 @@ _NON_TEXT_COMPONENT_TYPES = {
     "json",
 }
 
+# 复读内容种类：text=文字 / sticker=表情包图片 / face=QQ原生表情
+_KIND_TEXT = "text"
+_KIND_STICKER = "sticker"
+_KIND_FACE = "face"
+_KIND_LABELS = {_KIND_TEXT: "文字", _KIND_STICKER: "表情包", _KIND_FACE: "QQ表情"}
+
+# QQ原生表情入站文本形如「[微笑]」（适配器按映射表文本化，face_id 已丢失）
+_FACE_TEXT_PATTERN = re.compile(r"^\[([^\[\]]{1,16})\]$")
+
+# 表情包 base64 内存缓存上限（没有按 hash 回查图片的官方能力，必须自带缓存）。
+# 数量与字节双上限，且缓存条目 TTL 与复读窗口绑定，超限挤掉最旧的。
+_STICKER_CACHE_MAX_ENTRIES = 16
+_STICKER_CACHE_MAX_BYTES = 24 * 1024 * 1024
+
+# snowluma-adapter 的插件 id（QQ原生表情复读的适配目标，缺失时告警提示）
+_SNOWLUMA_ADAPTER_ID = "maibot-team.snowluma-adapter"
+
 
 class RepeaterPlugin(MaiBotPlugin):
     """麦麦复读机主类。
 
     状态（均为内存态，插件重载后自然清零）：
-    - _window:          stream_id -> deque[(ts, user_id, norm_text, raw_text)]
-    - _repeated:        stream_id -> {norm_text: 首次复读时间}（一次复读记忆）
+    - _window:          stream_id -> deque[(ts, user_id, kind, key, payload)]
+    - _repeated:        stream_id -> {"kind:key": 首次复读时间}（一次复读记忆）
+    - _sticker_cache:   图片hash -> (最近出现时间, base64)（表情包复读发送数据源）
     - _last_repeat:     stream_id -> 最近一次复读信息（仅用于状态展示）
     - _pending_note:    stream_id -> 待注入 planner 的提示（注入一次后即消费）
     - _cooldown_until:  stream_id -> 冷却截止时间戳
@@ -84,6 +111,7 @@ class RepeaterPlugin(MaiBotPlugin):
         super().__init__()
         self._window: dict[str, deque] = {}
         self._repeated: dict[str, dict[str, float]] = {}
+        self._sticker_cache: dict[str, tuple[float, str]] = {}
         self._last_repeat: dict[str, dict[str, Any]] = {}
         self._pending_note: dict[str, dict[str, Any]] = {}
         self._cooldown_until: dict[str, float] = {}
@@ -104,12 +132,16 @@ class RepeaterPlugin(MaiBotPlugin):
             f"一次记忆={c.once.repeated_memory_ttl}s, "
             f"planner守卫={'开' if c.planner_guard.enabled else '关'}"
             f"（只注入一次, 提示有效期{c.planner_guard.pending_ttl}s）, "
-            f"延迟={c.repeat.delay_min}~{c.repeat.delay_max}s"
+            f"延迟={c.repeat.delay_min}~{c.repeat.delay_max}s, "
+            f"表情包复读={'开' if c.sticker.enabled else '关'}, "
+            f"QQ表情复读={'开' if c.qq_face.enabled else '关'}"
+            f"（真实表情{'开' if c.qq_face.send_native else '关'}）"
         )
         self.ctx.logger.info(
             f"[复读机] 自身身份: 账号={sorted(self._self_ids) or '(无)'}, "
             f"称呼={self._bot_names or '(无)'}"
         )
+        await self._probe_face_adapter()
 
     async def on_unload(self) -> None:
         """卸载插件。"""
@@ -124,7 +156,9 @@ class RepeaterPlugin(MaiBotPlugin):
             c = self.config
             self.ctx.logger.info(
                 f"[复读机] 配置已热更新: 阈值={c.repeat.min_count}条/{c.repeat.min_senders}人, "
-                f"planner守卫={'开' if c.planner_guard.enabled else '关'}"
+                f"planner守卫={'开' if c.planner_guard.enabled else '关'}, "
+                f"表情包复读={'开' if c.sticker.enabled else '关'}, "
+                f"QQ表情复读={'开' if c.qq_face.enabled else '关'}"
             )
         elif scope == "bot":
             # 昵称/别名/账号变了，重新加载自身身份
@@ -184,6 +218,34 @@ class RepeaterPlugin(MaiBotPlugin):
         self._self_ids = ids
         self._bot_names = list(dict.fromkeys(names))
 
+    async def _probe_face_adapter(self) -> None:
+        """QQ原生表情复读的适配器探测（提醒用户，不做硬性拦截）。
+
+        真实 QQ 表情通过 face 消息段发送，依赖 snowluma-adapter 的 dict 组件
+        解包逻辑；其他适配器可能不支持。发送失败时插件会自动降级为文本复读，
+        但这里仍在加载时主动探测并提示，让用户提前知晓。
+        """
+        if not self.config.qq_face.enabled:
+            return
+        try:
+            result = await self.ctx.component.list_loaded_plugins()
+        except Exception as exc:
+            self.ctx.logger.warning(f"[复读机] 探测适配器列表失败（不影响复读）: {exc}")
+            return
+        plugins: list[str] = []
+        if isinstance(result, dict):
+            raw = result.get("plugins")
+            if isinstance(raw, list):
+                plugins = [str(p) for p in raw]
+        elif isinstance(result, list):
+            plugins = [str(p) for p in result]
+        found = any(_SNOWLUMA_ADAPTER_ID in p or "snowluma" in p.lower() for p in plugins)
+        if not found:
+            self.ctx.logger.warning(
+                f"[复读机] 未检测到 {_SNOWLUMA_ADAPTER_ID}：QQ原生表情复读发送真实表情仅适配 "
+                "snowluma-adapter，其他适配器将自动降级为文本复读；如不需要可关闭该功能"
+            )
+
     # ── Hook 1: 入站消息检测（OBSERVE 只读旁路） ───────────────────────
 
     @HookHandler(
@@ -208,16 +270,6 @@ class RepeaterPlugin(MaiBotPlugin):
         stream_id, user_id, text = self._extract_fields(msg)
         if not stream_id or not user_id:
             return None
-        if not text:
-            return None
-
-        stripped = text.strip()
-        if not stripped or stripped.startswith("/"):
-            return None
-        max_len = int(self.config.repeat.max_text_length)
-        if max_len > 0 and len(stripped) > max_len:
-            self._vlog(f"[复读机] 文本超长({len(stripped)}>{max_len})，不参与: {stream_id}")
-            return None
 
         ignored = {str(u) for u in self.config.filter.ignored_user_ids if str(u).strip()}
         if user_id in ignored:
@@ -229,19 +281,128 @@ class RepeaterPlugin(MaiBotPlugin):
             self._vlog(f"[复读机] 消息来自机器人自身（user_id={user_id}），不参与判定")
             return None
 
-        # 功能②：文本里出现机器人昵称/别名，不跟读
-        hit_name = self._match_bot_name(stripped)
-        if hit_name:
-            self._vlog(f"[复读机] 文本含机器人称呼「{hit_name}」，不参与判定")
+        classified = self._classify_message(msg, text)
+        if classified is None:
             return None
+        kind, key, payload = classified
 
-        excluded, reason = self._exclude_reason(msg, stripped)
-        if excluded:
-            self._vlog(f"[复读机] {reason}，不参与判定: {stream_id}")
-            return None
+        if kind == _KIND_TEXT:
+            stripped = text.strip()
+            if not stripped or stripped.startswith("/"):
+                return None
+            max_len = int(self.config.repeat.max_text_length)
+            if max_len > 0 and len(stripped) > max_len:
+                self._vlog(f"[复读机] 文本超长({len(stripped)}>{max_len})，不参与: {stream_id}")
+                return None
 
-        self._handle_inbound(stream_id, user_id, text)
+            # 功能②：文本里出现机器人昵称/别名，不跟读
+            hit_name = self._match_bot_name(stripped)
+            if hit_name:
+                self._vlog(f"[复读机] 文本含机器人称呼「{hit_name}」，不参与判定")
+                return None
+
+            excluded, reason = self._exclude_reason(msg, stripped)
+            if excluded:
+                self._vlog(f"[复读机] {reason}，不参与判定: {stream_id}")
+                return None
+
+            key = self._normalize(text)
+            if not key:
+                return None
+            payload = text
+
+        self._handle_inbound(stream_id, user_id, kind, key, payload)
         return None
+
+    # ── 消息分类：text / sticker / face ────────────────────────────────
+
+    def _classify_message(self, msg: dict[str, Any], text: str) -> tuple[str, str, Any] | None:
+        """把入站消息分类为复读单元 (kind, key, payload)。
+
+        - 纯表情消息（单条只有一个 emoji 组件）→ sticker，key=图片内容指纹
+          （SHA256 hash），发送数据（base64）存入内存缓存；
+        - 单文本组件且完整形如「[微笑]」且命中内置映射表 → face，key=表情名
+          （casefold），payload={id, text}；
+        - 其余一律走文字复读通道（key 由调用方归一化后填写）；
+        - 返回 None 表示不参与复读（对应功能关闭、图片数据缺失等）。
+        """
+        components = self._component_list(msg)
+        if components is not None and len(components) == 1 and isinstance(components[0], dict):
+            comp = components[0]
+            ctype = str(comp.get("type") or comp.get("format_name") or "").strip().lower()
+
+            if ctype == "emoji":
+                return self._classify_sticker(comp)
+            if ctype == "text" and self.config.qq_face.enabled:
+                return self._classify_face(text)
+
+        return (_KIND_TEXT, "", None)
+
+    def _classify_sticker(self, comp: dict[str, Any]) -> tuple[str, str, Any] | None:
+        """纯表情消息 → sticker 复读单元；功能关闭或图片数据缺失时返回 None。
+
+        Hook 载荷中 emoji 组件带 hash（SHA256）与 binary_data_base64（完整图片
+        字节）。超过 emoji.max_emoji_size_mb 未入库等场景拿不到 base64，无法
+        跟发，直接跳过（与旧版"非文本不参与"行为一致）。
+        """
+        if not self.config.sticker.enabled:
+            return None
+        binary_hash = str(comp.get("hash") or "").strip()
+        binary_base64 = str(comp.get("binary_data_base64") or "").strip()
+        if not binary_hash or not binary_base64:
+            self._vlog("[复读机] 表情包缺少图片数据（hash/base64），无法跟发")
+            return None
+        self._cache_sticker(binary_hash, binary_base64)
+        # payload 用文本化占位（如「[表情包: 描述]」）仅供展示/planner 提示，发送走缓存
+        return (_KIND_STICKER, binary_hash, str(comp.get("data") or "[表情包]"))
+
+    def _classify_face(self, text: str) -> tuple[str, str, Any]:
+        """单文本组件 → 尝试识别为QQ原生表情文本（如「[微笑]」）。
+
+        QQ 小黄脸在入站时被适配器文本化成「[名称]」，face_id 已丢失，按内置
+        映射表（qq_face_data.py）反查。未命中（用户手打的方括号文本、未知
+        表情占位「[表情]」等）回落文字复读通道，保持原有行为。
+        """
+        stripped = text.strip()
+        match = _FACE_TEXT_PATTERN.match(stripped)
+        if not match:
+            return (_KIND_TEXT, "", None)
+        name = match.group(1)
+        face_id = self._lookup_face_id(name)
+        if not face_id:
+            return (_KIND_TEXT, "", None)
+        return (_KIND_FACE, name.casefold(), {"id": face_id, "text": stripped})
+
+    @staticmethod
+    def _lookup_face_id(name: str) -> str:
+        """按表情名反查 face_id（先精确匹配，再忽略大小写）。"""
+        return QQ_FACE_IDS_BY_NAME.get(name) or QQ_FACE_IDS_BY_NAME.get(name.casefold()) or ""
+
+    def _cache_sticker(self, binary_hash: str, binary_base64: str) -> None:
+        """缓存表情包图片数据（hash -> base64），并做 TTL 与容量修剪。"""
+        now = time.time()
+        self._sticker_cache[binary_hash] = (now, binary_base64)
+        self._prune_sticker_cache(now)
+
+    def _prune_sticker_cache(self, now: float) -> None:
+        """修剪表情包缓存：TTL 过期清理，数量/字节超限挤掉最旧的。"""
+        cfg = self.config.repeat
+        ttl = (
+            max(1.0, float(cfg.window_seconds) + max(float(cfg.delay_min), float(cfg.delay_max)))
+            + 10.0
+        )
+        expired = [h for h, (ts, _) in self._sticker_cache.items() if now - ts > ttl]
+        for h in expired:
+            self._sticker_cache.pop(h, None)
+
+        # 触发必然发生在窗口期内，TTL 之外条目不会被用到；容量上限防内存膨胀
+        while len(self._sticker_cache) > _STICKER_CACHE_MAX_ENTRIES:
+            oldest = min(self._sticker_cache, key=lambda h: self._sticker_cache[h][0])
+            self._sticker_cache.pop(oldest, None)
+        total_bytes = sum(len(b64) for _, b64 in self._sticker_cache.values())
+        while total_bytes > _STICKER_CACHE_MAX_BYTES and self._sticker_cache:
+            oldest = min(self._sticker_cache, key=lambda h: self._sticker_cache[h][0])
+            total_bytes -= len(self._sticker_cache.pop(oldest)[1])
 
     def _is_self_message(self, msg: dict[str, Any], user_id: str) -> bool:
         """判断这条消息是不是机器人自己发出的。
@@ -305,67 +466,69 @@ class RepeaterPlugin(MaiBotPlugin):
                     return True, f"命中排除关键词「{kw}」"
         return False, ""
 
-    def _component_types(self, msg: dict[str, Any]) -> set[str]:
-        """提取消息的组件类型集合（兼容 type / format_name 两种序列化键）。"""
+    def _component_list(self, msg: dict[str, Any]) -> list[Any] | None:
+        """提取消息的组件列表（兼容 dict.components / 裸列表两种序列化）。"""
         raw = msg.get("raw_message")
         components: Any = None
         if isinstance(raw, dict):
             components = raw.get("components")
         elif isinstance(raw, list):
             components = raw
+        return components if isinstance(components, list) else None
+
+    def _component_types(self, msg: dict[str, Any]) -> set[str]:
+        """提取消息的组件类型集合（兼容 type / format_name 两种序列化键）。"""
         types: set[str] = set()
-        if isinstance(components, list):
-            for comp in components:
-                if not isinstance(comp, dict):
-                    continue
-                name = comp.get("type") or comp.get("format_name")
-                if name:
-                    types.add(str(name).strip().lower())
+        for comp in self._component_list(msg) or []:
+            if not isinstance(comp, dict):
+                continue
+            name = comp.get("type") or comp.get("format_name")
+            if name:
+                types.add(str(name).strip().lower())
         return types
 
-    def _handle_inbound(self, stream_id: str, user_id: str, text: str) -> None:
+    def _handle_inbound(self, stream_id: str, user_id: str, kind: str, key: str, payload: Any) -> None:
         """记录消息并判定是否触发复读；命中则安排发送任务。"""
-        trigger_text = self._record_and_check(stream_id, user_id, text)
-        if trigger_text is None:
+        if not self._record_and_check(stream_id, user_id, kind, key):
             return
-        # 触发即记账（一次记忆 + 冷却），后续同文本消息不会重复触发
-        self._mark_repeated(stream_id, trigger_text)
+        # 触发即记账（一次记忆 + 冷却），后续同内容消息不会重复触发
+        self._mark_repeated(stream_id, kind, key, payload)
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self._do_repeat(stream_id, trigger_text))
+            loop.create_task(self._do_repeat(stream_id, kind, key, payload))
         except RuntimeError:
             self.ctx.logger.warning("[复读机] 无运行中的事件循环，放弃本次复读")
 
-    def _record_and_check(self, stream_id: str, user_id: str, text: str) -> str | None:
-        """更新滑动窗口；满足条件返回待复读原文，否则返回 None。"""
+    def _record_and_check(self, stream_id: str, user_id: str, kind: str, key: str) -> bool:
+        """更新滑动窗口；满足条件返回 True。"""
         cfg = self.config.repeat
         now = time.time()
         win = self._window.setdefault(stream_id, deque(maxlen=64))
         while win and now - win[0][0] > max(1.0, float(cfg.window_seconds)):
             win.popleft()
 
-        norm = self._normalize(text)
-        if not norm:
-            return None
-        win.append((now, user_id, norm, text))
+        if not key:
+            return False
+        win.append((now, user_id, kind, key))
 
-        matches = [e for e in win if e[2] == norm]
+        matches = [e for e in win if e[2] == kind and e[3] == key]
         senders = {e[1] for e in matches}
         min_count = max(2, int(cfg.min_count))
         min_senders = max(1, int(cfg.min_senders))
         self._vlog(
-            f"[复读机] {stream_id} 文本「{self._preview(text)}」窗口内 "
+            f"[复读机] {stream_id} 内容「{self._kind_preview(kind, key)}」窗口内 "
             f"{len(matches)}条/{len(senders)}人 (需 {min_count}条/{min_senders}人)"
         )
         if len(matches) < min_count or len(senders) < min_senders:
-            return None
+            return False
 
-        # 需求1：同一句话只复读一次（记忆期内）
+        # 需求1：同一内容只复读一次（记忆期内，key 带 kind 前缀）
         memory = self._repeated.setdefault(stream_id, {})
+        memory_key = f"{kind}:{key}"
         ttl = float(self.config.once.repeated_memory_ttl)
-        if norm in memory and (ttl <= 0 or now - memory[norm] < ttl):
-            self._vlog(f"[复读机] 「{self._preview(text)}」已复读过，本次不跟")
-            return None
+        if memory_key in memory and (ttl <= 0 or now - memory[memory_key] < ttl):
+            self._vlog(f"[复读机] 「{self._kind_preview(kind, key)}」已复读过，本次不跟")
+            return False
         if ttl > 0:
             expired = [k for k, t in memory.items() if now - t >= ttl]
             for k in expired:
@@ -373,28 +536,29 @@ class RepeaterPlugin(MaiBotPlugin):
 
         # 冷却期内不跟新的复读潮
         if now < self._cooldown_until.get(stream_id, 0.0):
-            self._vlog(f"[复读机] {stream_id} 复读冷却中，不跟「{self._preview(text)}」")
-            return None
+            self._vlog(f"[复读机] {stream_id} 复读冷却中，不跟「{self._kind_preview(kind, key)}」")
+            return False
 
-        return text
+        return True
 
-    def _mark_repeated(self, stream_id: str, raw_text: str) -> None:
+    def _mark_repeated(self, stream_id: str, kind: str, key: str, payload: Any) -> None:
         """记账：一次复读记忆 + 待注入 planner 提示（一次性）+ 冷却。"""
         now = time.time()
-        norm = self._normalize(raw_text)
-        self._repeated.setdefault(stream_id, {})[norm] = now
+        self._repeated.setdefault(stream_id, {})[f"{kind}:{key}"] = now
         self._last_repeat[stream_id] = {
-            "text": raw_text,
-            "norm": norm,
+            "kind": kind,
+            "text": self._kind_display(kind, key, payload),
+            "norm": f"{kind}:{key}",
             "ts": now,
             "sent": False,
         }
         self._cooldown_until[stream_id] = now + max(0.0, float(self.config.repeat.cooldown_seconds))
         self.ctx.logger.info(
-            f"[复读机] 判定复读潮成立，准备跟读「{self._preview(raw_text)}」| stream={stream_id}"
+            f"[复读机] 判定复读潮成立，准备跟读{_KIND_LABELS.get(kind, kind)}"
+            f"「{self._kind_preview(kind, key)}」| stream={stream_id}"
         )
 
-    async def _do_repeat(self, stream_id: str, text: str) -> None:
+    async def _do_repeat(self, stream_id: str, kind: str, key: str, payload: Any) -> None:
         """直发复读内容（原样单条，不经过 AI 链路）。"""
         delay_min = max(0.0, float(self.config.repeat.delay_min))
         delay_max = max(delay_min, float(self.config.repeat.delay_max))
@@ -402,24 +566,61 @@ class RepeaterPlugin(MaiBotPlugin):
         if delay > 0:
             await asyncio.sleep(delay)
 
-        info = self._last_repeat.get(stream_id) or {}
         try:
-            ok = await self.ctx.send.text(text=text, stream_id=stream_id)
+            ok = await self._send_repeat(stream_id, kind, key, payload)
         except Exception as exc:
             self.ctx.logger.error(f"[复读机] 复读发送异常: {exc}")
             return
 
+        info = self._last_repeat.get(stream_id) or {}
         if ok:
             if isinstance(info, dict):
                 info["sent"] = True
             # 复读确实发出后才挂待注入提示：下一次 planner 请求消费一次即消失
-            self._pending_note[stream_id] = {"text": text, "ts": time.time()}
-            self.ctx.logger.info(f"[复读机] 复读已发送: {self._preview(text)} | stream={stream_id}")
+            self._pending_note[stream_id] = {
+                "text": self._kind_display(kind, key, payload),
+                "kind": kind,
+                "ts": time.time(),
+            }
+            self.ctx.logger.info(
+                f"[复读机] 复读已发送（{_KIND_LABELS.get(kind, kind)}）: "
+                f"{self._kind_preview(kind, key)} | stream={stream_id}"
+            )
         else:
             self.ctx.logger.warning(
-                "[复读机] send.text 返回 False（可能被 output_blocker 等出站 Hook 拦截），本次复读未发出，"
+                "[复读机] 复读发送未成功（可能被出站 Hook 拦截），本次复读未发出，"
                 "不向 planner 注入提示"
             )
+
+    async def _send_repeat(self, stream_id: str, kind: str, key: str, payload: Any) -> bool:
+        """按内容种类选择发送通道；返回是否发送成功。
+
+        - text: ctx.send.text 原样单条；
+        - sticker: ctx.send.emoji 回发缓存中的同一张图（纯 base64）；
+        - face: ctx.send.custom("face", id) 发送真实QQ表情（依赖 snowluma-adapter），
+          发送失败自动降级为文本复读。
+        """
+        if kind == _KIND_STICKER:
+            cached = self._sticker_cache.get(key)
+            if not cached or not cached[1]:
+                self.ctx.logger.warning("[复读机] 表情包图片数据已不在缓存中（过期或被挤出），放弃跟发")
+                return False
+            return bool(await self.ctx.send.emoji(cached[1], stream_id))
+
+        if kind == _KIND_FACE:
+            payload_data = payload if isinstance(payload, dict) else {}
+            face_id = str(payload_data.get("id") or "")
+            fallback_text = str(payload_data.get("text") or f"[{key}]")
+            if self.config.qq_face.send_native and face_id:
+                ok = bool(await self.ctx.send.custom("face", face_id, stream_id))
+                if ok:
+                    return True
+                self.ctx.logger.warning(
+                    "[复读机] send.custom(face) 未成功（可能适配器不支持 face 段），降级为文本复读"
+                )
+            return bool(await self.ctx.send.text(text=fallback_text, stream_id=stream_id))
+
+        return bool(await self.ctx.send.text(text=str(payload or ""), stream_id=stream_id))
 
     # ── Hook 2: planner 防复读守卫（需求2） ────────────────────────────
 
@@ -454,11 +655,26 @@ class RepeaterPlugin(MaiBotPlugin):
             return base
         stream_id, info = found
 
-        note = (
-            f"{_PLANNER_NOTE_PREFIX}你刚才跟风复读过一次「{self._preview(info.get('text', ''))}」"
-            "（这是插件自动参与群友复读，不是你主动想说的），"
-            "知道这件事就行，不用再重复这句话，按正常聊天继续。"
-        )
+        kind = str(info.get("kind") or _KIND_TEXT)
+        display = self._preview(info.get("text", ""))
+        if kind == _KIND_STICKER:
+            note = (
+                f"{_PLANNER_NOTE_PREFIX}你刚才跟发了一张表情包「{display}」"
+                "（这是插件自动参与群友复读，不是你主动想发的），"
+                "知道这件事就行，不用再发表情包，按正常聊天继续。"
+            )
+        elif kind == _KIND_FACE:
+            note = (
+                f"{_PLANNER_NOTE_PREFIX}你刚才跟了一个QQ表情「{display}」"
+                "（这是插件自动参与群友复读，不是你主动想发的），"
+                "知道这件事就行，不用再发这个表情，按正常聊天继续。"
+            )
+        else:
+            note = (
+                f"{_PLANNER_NOTE_PREFIX}你刚才跟风复读过一次「{display}」"
+                "（这是插件自动参与群友复读，不是你主动想说的），"
+                "知道这件事就行，不用再重复这句话，按正常聊天继续。"
+            )
 
         target = self._inject_note(kwargs, note)
         if target is None:
@@ -601,12 +817,13 @@ class RepeaterPlugin(MaiBotPlugin):
         win = self._window.get(stream_id)
         lines.append(f"本会话窗口: {len(win) if win else 0} 条消息")
         memory = self._repeated.get(stream_id) or {}
-        lines.append(f"本会话已复读记忆: {len(memory)} 句")
+        lines.append(f"本会话已复读记忆: {len(memory)} 条")
         info = self._last_repeat.get(stream_id)
         if info:
             ago = max(0, int(now - float(info.get("ts", 0.0))))
+            kind_label = _KIND_LABELS.get(str(info.get("kind") or _KIND_TEXT), "文字")
             lines.append(
-                f"最近复读: {ago}s 前「{self._preview(str(info.get('text', '')))}」"
+                f"最近复读（{kind_label}）: {ago}s 前「{self._preview(str(info.get('text', '')))}」"
                 f"（已发出: {'是' if info.get('sent') else '否'}）"
             )
         else:
@@ -645,6 +862,26 @@ class RepeaterPlugin(MaiBotPlugin):
         if self.config.repeat.case_insensitive:
             t = t.casefold()
         return t
+
+    @staticmethod
+    def _kind_preview(kind: str, key: str) -> str:
+        """按内容种类生成日志/提示用的简短预览。"""
+        if kind == _KIND_STICKER:
+            return f"[表情包:{key[:8]}…]" if len(key) > 8 else "[表情包]"
+        if kind == _KIND_FACE:
+            return f"[{key}]"
+        return key
+
+    @staticmethod
+    def _kind_display(kind: str, key: str, payload: Any) -> str:
+        """按内容种类生成展示文本（rp_stat 与 planner 提示用）。"""
+        if isinstance(payload, dict):
+            text_val = payload.get("text")
+            if isinstance(text_val, str) and text_val:
+                return text_val
+        if isinstance(payload, str) and payload:
+            return payload
+        return RepeaterPlugin._kind_preview(kind, key)
 
     def _extract_fields(self, msg: dict[str, Any]) -> tuple[str, str, str]:
         """从序列化 SessionMessage 提取 (stream_id, user_id, text)。

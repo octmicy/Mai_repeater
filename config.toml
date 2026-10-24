@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "1.0.0"
+config_version = "1.1.0"
 
 [repeat]
 min_count = 3
@@ -31,10 +31,22 @@ auto_exclude_self = true
 exclude_bot_names = true
 # 额外补充的机器人称呼（主程序里没配的昵称填这里）
 bot_names_extra = []
-# 图片/表情/语音等非文本消息不参与复读（插件只能发文字，复读表情包没意义）
+# 图片/语音/视频等非文本消息不参与文字复读（表情包与QQ表情有独立复读通道，见下）
 exclude_non_text = true
-# 文本命中这些关键词不参与复读：MaiBot 会把表情包文本化成「[表情包：xxx]」
-exclude_keywords = ["表情包", "[图片]", "[动画表情]", "[语音]", "[视频]", "[文件]"]
+# 文字复读通道的排除关键词：表情包占位文本、未知表情占位等命中即跳过
+exclude_keywords = ["表情包", "[表情]", "[图片]", "[动画表情]", "[语音]", "[视频]", "[文件]"]
+
+[sticker]
+# 表情包复读：群友复读同一张表情包（图片/GIF/商城大表情）时跟发同款
+# 图片数据在内存中有上限缓存（16 张 / 24MB），自动过期清理
+enabled = true
+
+[qq_face]
+# QQ原生表情复读：群友复读同一个QQ小黄脸时跟发同款
+enabled = true
+# 发送真实QQ表情（face 消息段）——⚠️ 仅适配 snowluma-adapter：
+# 其他适配器会自动降级为文本复读（发出 [微笑] 字面文本），不需要可关闭
+send_native = true
 
 [debug]
 dump_message_structure = false

@@ -2,8 +2,8 @@
   "manifest_version": 2,
   "id": "maibot-community.mai-repeater",
   "name": "麦麦的本质就是复读机",
-  "version": "1.3.0",
-  "description": "群聊复读插件：当群友复读时，插件会识别并通过 SDK 直接发送复读内容，避免分词器自动断句导致复读失败。",
+  "version": "1.4.0",
+  "description": "群聊复读插件：群友复读文字/表情包/QQ原生表情时，插件识别并通过 SDK 直接发送复读内容，避免分词器自动断句导致复读失败。",
   "author": {
     "name": "octmicy",
     "url": "https://github.com/octmicy/Mai_repeater"
@@ -26,7 +26,10 @@
   "plugin_type": "extension",
   "capabilities": [
     "send.text",
-    "config.get"
+    "send.emoji",
+    "send.custom",
+    "config.get",
+    "component.list_loaded_plugins"
   ],
   "i18n": {
     "default_locale": "zh-CN",

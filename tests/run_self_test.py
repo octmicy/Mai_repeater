@@ -3,7 +3,9 @@
 覆盖：
 - 复读判定（条数/人数/窗口/冷却/一次记忆）
 - 直发内容一致性（发送原文而非归一化文本）
-- planner 守卫注入（追加语义、TTL、会话匹配）
+- 表情包复读（send.emoji 同款回发、缓存上限、开关与数据门槛）
+- QQ原生表情复读（映射表反查、send.custom、失败降级、开关）
+- planner 守卫注入（追加语义、TTL、会话匹配、按内容种类措辞）
 - 过滤规则（命令、超长、忽略名单）
 - /rp_stat 命令与工厂函数
 """
@@ -52,13 +54,23 @@ class FakeLogger:
 
 
 class FakeSend:
-    def __init__(self, result: bool = True) -> None:
+    def __init__(self, result: bool = True, custom_result: bool | None = None) -> None:
         self.result = result
+        # send.custom 单独控制返回值（模拟不支持 face 段的适配器）
+        self.custom_result = result if custom_result is None else custom_result
         self.sent: list[dict[str, Any]] = []
 
     async def text(self, text: str, stream_id: str, **kwargs: Any) -> Any:
         self.sent.append({"text": text, "stream_id": stream_id})
         return self.result
+
+    async def emoji(self, emoji_data: str, stream_id: str, **kwargs: Any) -> Any:
+        self.sent.append({"emoji": emoji_data, "stream_id": stream_id})
+        return self.result
+
+    async def custom(self, custom_type: str, data: Any, stream_id: str, **kwargs: Any) -> Any:
+        self.sent.append({"custom_type": custom_type, "data": data, "stream_id": stream_id})
+        return self.custom_result
 
 
 class FakeConfig:
@@ -73,11 +85,31 @@ class FakeConfig:
         return self.values.get(key, default)
 
 
+class FakeComponent:
+    """mock ctx.component：list_loaded_plugins 返回已加载插件 id 列表。"""
+
+    def __init__(self, plugins: list[str] | None = None) -> None:
+        self.plugins = (
+            plugins
+            if plugins is not None
+            else ["maibot-team.snowluma-adapter", "maibot-community.mai-repeater"]
+        )
+
+    async def list_loaded_plugins(self) -> dict[str, Any]:
+        return {"success": True, "plugins": list(self.plugins)}
+
+
 class FakeCtx:
-    def __init__(self, send: FakeSend | None = None, config: FakeConfig | None = None) -> None:
+    def __init__(
+        self,
+        send: FakeSend | None = None,
+        config: FakeConfig | None = None,
+        component: FakeComponent | None = None,
+    ) -> None:
         self.logger = FakeLogger()
         self.send = send or FakeSend()
         self.config = config or FakeConfig()
+        self.component = component or FakeComponent()
 
 
 def make_plugin(
@@ -109,8 +141,10 @@ def make_plugin(
             "exclude_bot_names": True,
             "bot_names_extra": [],
             "exclude_non_text": True,
-            "exclude_keywords": ["表情包", "[图片]", "[动画表情]", "[语音]", "[视频]", "[文件]"],
+            "exclude_keywords": ["表情包", "[表情]", "[图片]", "[动画表情]", "[语音]", "[视频]", "[文件]"],
         },
+        "sticker": {"enabled": True},
+        "qq_face": {"enabled": True, "send_native": True},
         "debug": {"dump_message_structure": False, "verbose_log": False},
     }
     if overrides:
@@ -129,6 +163,8 @@ def make_msg(stream: str, uid: str, text: str) -> dict[str, Any]:
         "message": {
             "message_info": {"user_info": {"user_id": uid}, "chat_id": stream},
             "processed_plain_text": text,
+            # 真实 Hook 载荷必带组件列表；单文本组件与纯文本等价
+            "raw_message": {"components": [{"type": "text", "data": text}]},
         }
     }
 
@@ -144,8 +180,39 @@ def make_media_msg(stream: str, uid: str, comp_type: str, text: str = "") -> dic
     }
 
 
+def make_emoji_msg(stream: str, uid: str, binary_hash: str, b64: str = "AAABAA==") -> dict[str, Any]:
+    """构造 Hook 载荷形态的纯表情包消息（emoji 组件带 hash + base64）。"""
+    return {
+        "message": {
+            "message_info": {"user_info": {"user_id": uid}, "chat_id": stream},
+            "processed_plain_text": "[表情包]",
+            "raw_message": {
+                "components": [
+                    {"type": "emoji", "data": "[表情包]", "hash": binary_hash, "binary_data_base64": b64}
+                ]
+            },
+        }
+    }
+
+
+def make_multi_comp_msg(stream: str, uid: str, text: str, comps: list[dict[str, Any]]) -> dict[str, Any]:
+    """构造多组件混合消息。"""
+    return {
+        "message": {
+            "message_info": {"user_info": {"user_id": uid}, "chat_id": stream},
+            "processed_plain_text": text,
+            "raw_message": {"components": comps},
+        }
+    }
+
+
 async def feed(plugin: Any, stream: str, uid: str, text: str) -> None:
     await plugin.on_message(**make_msg(stream, uid, text))
+    await asyncio.sleep(0.02)
+
+
+async def feed_emoji(plugin: Any, stream: str, uid: str, binary_hash: str, b64: str = "AAABAA==") -> None:
+    await plugin.on_message(**make_emoji_msg(stream, uid, binary_hash, b64))
     await asyncio.sleep(0.02)
 
 
@@ -188,9 +255,9 @@ async def case_memory_ttl_expiry() -> None:
     for uid in ("u1", "u2", "u3"):
         await feed(p, "s4", uid, "冲！")
     check(len(ctx.send.sent) == 1, "TTL 内第一波触发")
-    # 伪造记忆过期
+    # 伪造记忆过期（记忆 key 带 kind 前缀：text:<归一化文本>）
     norm = p._normalize("冲！")
-    p._repeated["s4"][norm] = time.time() - 100.0
+    p._repeated["s4"][f"text:{norm}"] = time.time() - 100.0
     p._cooldown_until["s4"] = 0.0
     for uid in ("u1", "u2", "u3"):
         await feed(p, "s4", uid, "冲！")
@@ -558,6 +625,151 @@ async def case_config_field_consistency() -> None:
     check(not missing, f"plugin.py 引用的配置字段均存在（缺失: {missing}）")
 
 
+async def case_sticker_repeat() -> None:
+    """表情包复读：同 hash 表情凑齐阈值 → send.emoji 回发同款；缓存有上限。"""
+    from Mai_repeater.plugin import _STICKER_CACHE_MAX_ENTRIES
+
+    p, ctx = make_plugin()
+    for uid in ("u1", "u2", "u3"):
+        await feed_emoji(p, "s50", uid, "hashAAA")
+    emoji_sends = [s for s in ctx.send.sent if "emoji" in s]
+    check(len(emoji_sends) == 1, "表情包复读潮触发且仅一次")
+    check(emoji_sends[0]["emoji"] == "AAABAA==", "send.emoji 回发缓存中的原图 base64")
+    check(emoji_sends[0]["stream_id"] == "s50", "表情包复读发送到正确会话")
+    check("hashAAA" in p._sticker_cache, "表情包图片数据已入缓存")
+
+    # 一次记忆：记忆期内同 hash 再来一波不跟
+    for uid in ("u4", "u5", "u6"):
+        await feed_emoji(p, "s50", uid, "hashAAA")
+    emoji_sends = [s for s in ctx.send.sent if "emoji" in s]
+    check(len(emoji_sends) == 1, "同一张表情包记忆期内不再跟")
+
+    # 冷却跨内容种类共享：冷却期内新表情包不触发
+    for uid in ("u1", "u2", "u3"):
+        await feed_emoji(p, "s50", uid, "hashBBB")
+    emoji_sends = [s for s in ctx.send.sent if "emoji" in s]
+    check(len(emoji_sends) == 1, "冷却期内新表情包不触发（冷却跨种类共享）")
+
+    # rp_stat 展示表情包种类标签
+    ok, _, _ = await p.cmd_stat(text="/rp_stat", stream_id="s50")
+    check(ok and "最近复读（表情包）" in ctx.send.sent[-1]["text"], "/rp_stat 展示表情包种类标签")
+
+    # 缓存容量上限：塞入超限数量后条目数不超过上限，最旧的被挤掉
+    for i in range(_STICKER_CACHE_MAX_ENTRIES + 5):
+        p._cache_sticker(f"hash{i:03d}", "QQ==")
+    check(len(p._sticker_cache) <= _STICKER_CACHE_MAX_ENTRIES, "表情包缓存数量上限生效")
+    check("hash000" not in p._sticker_cache, "超限时挤掉最旧的缓存条目")
+
+
+async def case_sticker_gates() -> None:
+    """表情包复读的开关与数据完整性门槛。"""
+    # 关闭功能 → 表情包不参与（与旧版行为一致）
+    p, ctx = make_plugin({"sticker": {"enabled": False}})
+    for uid in ("u1", "u2", "u3"):
+        await feed_emoji(p, "s51", uid, "hashOFF")
+    check(len(ctx.send.sent) == 0, "表情包复读关闭时不跟发")
+
+    # 缺少 base64（超限未入库等场景）→ 跳过
+    p, ctx = make_plugin()
+    await p.on_message(**make_emoji_msg("s52", "u1", "hashNOB64", b64=""))
+    await p.on_message(**make_emoji_msg("s52", "u2", "hashNOB64", b64=""))
+    await p.on_message(**make_emoji_msg("s52", "u3", "hashNOB64", b64=""))
+    await asyncio.sleep(0.02)
+    check(len(ctx.send.sent) == 0, "缺少图片数据的表情包不参与")
+
+    # 文字+表情混合消息 → 走文字通道，被非文本排除，不触发
+    p, ctx = make_plugin()
+    comps = [
+        {"type": "text", "data": "哈哈"},
+        {"type": "emoji", "data": "[表情包]", "hash": "hashMIX", "binary_data_base64": "QQ=="},
+    ]
+    for uid in ("u1", "u2", "u3"):
+        await p.on_message(**make_multi_comp_msg("s53", uid, "哈哈[表情包]", comps))
+        await asyncio.sleep(0.02)
+    check(len(ctx.send.sent) == 0, "文字+表情混合消息不触发复读")
+
+
+async def case_face_repeat() -> None:
+    """QQ原生表情复读：映射表反查 + send.custom(face) + 失败降级 + 开关。"""
+    from Mai_repeater.qq_face_data import QQ_FACE_IDS_BY_NAME
+
+    face_id = QQ_FACE_IDS_BY_NAME.get("微笑")
+    check(bool(face_id), "内置映射表包含「微笑」")
+
+    # 1. 三个不同人发 [微笑] → send.custom("face", id)
+    p, ctx = make_plugin()
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s60", uid, "[微笑]")
+    custom_sends = [s for s in ctx.send.sent if "custom_type" in s]
+    check(len(custom_sends) == 1, "QQ表情复读潮触发且仅一次")
+    check(custom_sends[0]["custom_type"] == "face", "通过 send.custom 发送 face 段")
+    check(custom_sends[0]["data"] == face_id, "face_id 来自内置映射表")
+
+    # 2. 原生发送失败（适配器不支持）→ 自动降级为文本复读
+    p, ctx = make_plugin()
+    ctx.send.custom_result = False
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s61", uid, "[微笑]")
+    text_sends = [s for s in ctx.send.sent if "text" in s]
+    check(len(text_sends) == 1, "send.custom 失败后降级发送一次")
+    check(text_sends[0].get("text") == "[微笑]", "降级发送文本为原表情占位文本")
+
+    # 3. send_native=False → 直接文本复读
+    p, ctx = make_plugin({"qq_face": {"send_native": False}})
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s62", uid, "[微笑]")
+    check(len(ctx.send.sent) == 1, "send_native 关闭时按文本复读")
+    check(ctx.send.sent[0].get("text") == "[微笑]", "send_native 关闭时发出占位文本")
+
+    # 4. qq_face.enabled=False → 完全走文字通道（旧版行为）
+    p, ctx = make_plugin({"qq_face": {"enabled": False}})
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s63", uid, "[微笑]")
+    check(len(ctx.send.sent) == 1, "QQ表情功能关闭时按普通文本复读")
+    check(ctx.send.sent[0].get("text") == "[微笑]", "关闭后发出的是字面文本")
+
+    # 5. 不在映射表中的方括号文本 → 按普通文本处理
+    p, ctx = make_plugin()
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s64", uid, "[不在表里的词]")
+    check(len(ctx.send.sent) == 1, "未知方括号文本按普通文本复读")
+    check("custom_type" not in ctx.send.sent[0], "未知方括号文本不发送 face 段")
+
+    # 6. 非完整方括号文本（夹带文字）不受表情识别影响
+    p, ctx = make_plugin()
+    for uid in ("u1", "u2", "u3"):
+        await feed(p, "s65", uid, "[微笑]哈哈")
+    check(len(ctx.send.sent) == 1, "夹带文字的表情文本按普通文本复读")
+    check(ctx.send.sent[0].get("text") == "[微笑]哈哈", "普通文本复读发送原文")
+
+
+async def case_planner_guard_sticker() -> None:
+    """表情包复读后的 planner 提示按内容种类措辞。"""
+    p, ctx = make_plugin()
+    for uid in ("u1", "u2", "u3"):
+        await feed_emoji(p, "s70", uid, "hashNOTE")
+    check("s70" in p._pending_note, "表情包复读后生成待注入提示")
+    result = await p.guard_planner(extra_prompt="base", reply_tool_args={"chat_id": "s70"})
+    injected = result["modified_kwargs"]["extra_prompt"]
+    check("跟发了一张表情包" in injected, "表情包复读提示按表情包措辞")
+    check("按正常聊天继续" in injected, "表情包提示措辞不压制发言意愿")
+    check("s70" not in p._pending_note, "表情包提示注入后消费")
+
+
+async def case_face_adapter_probe() -> None:
+    """加载时探测 snowluma-adapter，缺失时输出提醒（仅提醒，不拦截）。"""
+    p, ctx = make_plugin()
+    ctx.component = FakeComponent(plugins=["some-other-adapter"])
+    await p.on_load()
+    logs = " ".join(m for _, m in ctx.logger.messages)
+    check("snowluma-adapter" in logs, "未检测到 snowluma-adapter 时输出适配提醒")
+
+    p, ctx = make_plugin()
+    await p.on_load()
+    logs = " ".join(m for _, m in ctx.logger.messages)
+    check("未检测到" not in logs, "检测到 snowluma-adapter 时不提醒")
+
+
 async def case_rp_stat() -> None:
     p, ctx = make_plugin()
     ok, resp, intercept = await p.cmd_stat(text="/rp_stat", stream_id="s12")
@@ -578,6 +790,11 @@ async def main_async() -> None:
     await case_planner_guard_edge()
     await case_planner_guard_items()
     await case_self_and_name_filter()
+    await case_sticker_repeat()
+    await case_sticker_gates()
+    await case_face_repeat()
+    await case_planner_guard_sticker()
+    await case_face_adapter_probe()
     await case_disabled()
     await case_lifecycle()
     await case_config_field_consistency()

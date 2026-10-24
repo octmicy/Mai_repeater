@@ -1,22 +1,32 @@
 # 交接文档 — 麦麦的本质就是复读机（Mai_repeater）
 
 > 写给接手的人（也包括未来的自己 / 下一个 AI 会话）。
-> 最后更新：2026-10-24 ｜ 当前版本 **v1.3.0**
+> 最后更新：2026-10-24 ｜ 当前版本 **v1.4.0**
 
 ---
 
 ## 1. 这个项目是干什么的
 
-MaiBot（麦麦）的第三方插件。**群友开始复读时，麦麦跟着复读一句**，而且必须是"原文照发、单条发出"——不能经过 planner/replyer 被改写，也不能被分段器拆成好几条。
+MaiBot（麦麦）的第三方插件。**群友开始复读时，麦麦跟着复读一条**，而且必须"原文照发、单条发出"——不能经过 planner/replyer 被改写，也不能被分段器拆成好几条。v1.4.0 起支持三种内容：
 
 ```
 A：好好好
 B：好好好
 C：好好好
-麦麦：好好好        ← 插件直发，原样单条
+麦麦：好好好        ← 文字复读：ctx.send.text 原样单条
+
+A：[猫猫表情包]
+B：[猫猫表情包]
+C：[猫猫表情包]
+麦麦：[同款猫猫表情包]   ← 表情包复读：ctx.send.emoji 回发同一张图
+
+A：[微笑]
+B：[微笑]
+C：[微笑]
+麦麦：[微笑]        ← QQ原生表情复读：ctx.send.custom("face", id)（仅适配 snowluma-adapter）
 ```
 
-判定条件：滑动窗口内 **同一文本 ≥ 3 条** 且来自 **≥ 3 个不同的人**（不含麦麦自己）。
+判定条件：滑动窗口内**同一内容 ≥ 3 条**且来自 **≥ 3 个不同的人**（不含麦麦自己）。阈值/窗口/冷却/一次记忆对三种内容统一生效。
 
 ## 2. 仓库与路径
 
@@ -44,15 +54,16 @@ C：好好好
 ```
 Mai_repeater/
 ├── _manifest.json         插件清单（Host 严格校验，见第 9 节）
-├── plugin.py              全部逻辑（约 730 行，单文件）
-├── config.py              配置模型（6 个配置节）
+├── plugin.py              全部逻辑（单文件）
+├── config.py              配置模型（8 个配置节）
 ├── config.toml            默认配置（config_version 必须存在）
+├── qq_face_data.py        QQ表情「名称→face_id」映射表（503 项，生成自 snowluma-adapter，勿手改）
 ├── README.md              面向用户的说明（安装/配置/FAQ）
 ├── LICENSE                MIT
 ├── .gitignore             挡 __pycache__ / *.pyc / data / temp
 ├── assets/icon.jpg        WebUI 插件图标
 ├── +1.jpg                 图标的原始素材（保留未删）
-└── tests/run_self_test.py 自测（mock ctx，不依赖真机）72 项
+└── tests/run_self_test.py 自测（mock ctx，不依赖真机）105 项
 ```
 
 ## 5. 架构：三个入口
@@ -69,22 +80,28 @@ OBSERVE = 只读，**不拦截、不修改任何消息**（这是"不越权"的�
 
 1. 插件总开关
 2. 提取 `stream_id` / `user_id` / `text`（`_extract_fields`，兼容多种序列化结构）
-3. 空文本、`/` 开头命令、超长文本 → 跳过
-4. 忽略名单 `filter.ignored_user_ids`
-5. **自己发的消息** `_is_self_message` → 跳过
-6. **文本含机器人称呼** `_match_bot_name` → 跳过
-7. **非文本消息 / 排除关键词** `_exclude_reason` → 跳过
-8. 进入滑动窗口 `_record_and_check` → 命中则 `_mark_repeated` + `create_task(_do_repeat)`
+3. 忽略名单 `filter.ignored_user_ids`
+4. **自己发的消息** `_is_self_message` → 跳过
+5. **消息分类** `_classify_message`（v1.4.0）：
+   - 单条只有一个 `emoji` 组件 → **sticker**（key=图片 SHA256，base64 入缓存；功能关闭或数据缺失 → 不参与）
+   - 单个 `text` 组件且完整形如 `[微笑]` 且命中映射表 → **face**（key=表情名 casefold）
+   - 其余 → **text**
+6. text 类专属闸门（sticker/face 不经过）：空文本、`/` 开头命令、超长文本、
+   **文本含机器人称呼** `_match_bot_name`、**非文本组件/排除关键词** `_exclude_reason`
+7. 进入滑动窗口 `_record_and_check` → 命中则 `_mark_repeated` + `create_task(_do_repeat)`
 
-### ② 复读发送（直发通道）
+### ② 复读发送（直发通道，按种类分流）
 
 ```python
-await self.ctx.send.text(text=原文, stream_id=stream_id)
+text    → await self.ctx.send.text(text=原文, stream_id=stream_id)
+sticker → await self.ctx.send.emoji(缓存base64, stream_id=stream_id)
+face    → await self.ctx.send.custom("face", face_id, stream_id=stream_id)
+          失败自动降级 send.text("[微笑]")
 ```
 
-**为什么用直发而不是让 planner 说**：分段/改写发生在 replyer 侧（planner 决策 → replyer 生成 → 分段器拆条）。`ctx.send.text` 是独立发送通道，全程不过这三个环节，所以文本原样、单条、多长都一样。
+**为什么用直发而不是让 planner 说**：分段/改写发生在 replyer 侧（planner 决策 → replyer 生成 → 分段器拆条）。`ctx.send.*` 是独立发送通道，全程不过这三个环节，所以内容原样、单条、多长都一样。
 
-发送成功后才挂一条 planner 待注入提示（`_pending_note`）；发送失败（如被 output_blocker 拦截）则不挂。
+发送成功后才挂一条 planner 待注入提示（`_pending_note`）；发送失败则不挂。
 
 ### ③ planner 防复读守卫 Hook
 
@@ -93,23 +110,22 @@ await self.ctx.send.text(text=原文, stream_id=stream_id)
 async def guard_planner(self, **kwargs)
 ```
 
-目的：让 planner 知道"我刚复读过"，避免它自己再复读一遍。
+目的：让 planner 知道"我刚复读过"，避免它自己再复读一遍。提示措辞按内容种类区分（文字/表情包/QQ表情）。
 **关键设计见第 6 节第 3 条。**
 
 ### ④ 命令
 
-`/rp_stat` — 查看当前会话的窗口计数、已复读记忆、最近复读、守卫与冷却状态。
+`/rp_stat` — 查看当前会话的窗口计数、已复读记忆、最近复读（含种类标签）、守卫与冷却状态。
 
-## 6. 四个关键设计（改代码前务必理解）
+## 6. 五个关键设计（改代码前务必理解）
 
-### 1. 同一句话只复读一次
-`_repeated[stream_id][归一化文本] = 时间戳`，TTL 默认 **300 秒**。
-记忆期内同文本任何复读潮都直接跳过。
+### 1. 同一内容只复读一次
+`_repeated[stream_id]["kind:key"] = 时间戳`（key 带 kind 前缀，如 `text:好好好`、`sticker:<hash>`、`face:微笑`），TTL 默认 **300 秒**。记忆期内同内容任何复读潮都直接跳过。
 
 > 为什么是 5 分钟而不是 6 小时：太长会导致群友过一阵再刷同一个梗时麦麦不跟，显得反应迟钝。只覆盖"当次复读潮"的上下文即可。
 
-### 2. 判定用归一化文本，发送用原文
-`case_insensitive` / `normalize_whitespace` 只影响**判定**，`_do_repeat` 发送的始终是最后一条的**原文**。
+### 2. 判定用归一化内容，发送用原始数据
+文字：`case_insensitive` / `normalize_whitespace` 只影响**判定**，发送用最后一条**原文**。表情包判定按图片字节 SHA256（同款表情天然同 hash），发送回放缓存里的同一张图。QQ表情判定按表情名，发送按映射表反查的 face_id。
 
 ### 3. planner 提示只注入一次（最重要）
 - planner 的**默认动作就是 `no_reply`**；连续不动作会触发 `no_action_backoff`（15s→300s 递增退避）
@@ -126,25 +142,36 @@ Context Item 结构（写错字段主程序会抛异常）：
  "parts":[{"type":"text","text":"..."}]}
 ```
 
-### 4. 插件只能发文字，所以表情包/非文本一律排除
-MaiBot 会把表情包消息文本化成 `[表情包：xxx]` 这样的占位文本。如果拿它去复读，结果就是麦麦发一句莫名其妙的话（因为它发不了图）。
-两道保险：`exclude_non_text`（按组件类型：image/emoji/voice/video/file…）+ `exclude_keywords`（按文本关键词）。
+### 4. 表情包复读依赖内存缓存（v1.4.0）
+SDK **没有** `emoji.get_by_hash` 这类按内容回查图片的能力，触发复读时只能用当时收到的数据：
+- Hook 载荷的 emoji 组件自带 `hash`（SHA256）+ `binary_data_base64`（完整图片字节），分类时存入 `_sticker_cache[hash] = (时间, base64)`
+- 缓存三重上限：TTL = 窗口 + 最大延迟 + 10s（触发必然发生在窗口期内）、**16 条**、**24MB**，超限挤最旧的
+- 发送时缓存被挤出/过期 → 放弃本次跟发并告警
+- base64 拿不到的场景（超 `emoji.max_emoji_size_mb`=5MB 未入库）直接不参与判定
+- 发送侧事实：`send.emoji` 只收**纯 base64**（不支持路径/URL/data: 前缀）；出站到 snowluma-adapter 变成 OneBot `image sub_type=1` 动画表情段；hash 命中表情库时只累计使用次数，不会把图注册进库
+
+### 5. QQ原生表情走 DictComponent 兜底通道（仅适配 snowluma-adapter）
+- QQ 小黄脸入站时被适配器**文本化**成 `[微笑]`（face_id 丢失），核心组件模型里根本没有 face 组件
+- 出站通路：`ctx.send.custom("face", id)` → Host 兜底成 `DictComponent({"type":"face","data":id})` → snowluma-adapter 的 dict 解包器还原成 OneBot face 段（**这段解包逻辑是 snowluma 特有的**）
+- 映射表 `qq_face_data.py`（503 项）生成自 snowluma-adapter 的 `qq_face_map.py`（koishi QFace，2026-09-28 同步），规则与其出站编码器一致（十进制 id、同名取首个）——适配器更新后需重新生成
+- 三重保护：`send.custom` 失败自动降级文本复读；`on_load` 探测不到 snowluma-adapter 时告警提醒；配置开关 `qq_face.send_native` 可整体关掉
+- 误报边界：用户手打的 `[微笑]` 字面文本也会被当成表情复读（概率低、语义一致，README 已注明）
 
 ## 7. 配置项全表
 
 | 分组 | 配置项 | 默认 | 说明 |
 |------|--------|------|------|
 | plugin | `enabled` | `true` | 总开关 |
-| plugin | `config_version` | `1.0.0` | schema 版本，**不可删**（缺了插件被拒） |
+| plugin | `config_version` | `1.1.0` | schema 版本，**不可删**（缺了插件被拒） |
 | repeat | `min_count` | `3` | 触发所需相同消息条数 |
 | repeat | `min_senders` | `3` | 触发所需不同人数 |
 | repeat | `window_seconds` | `120` | 统计窗口（秒） |
-| repeat | `max_text_length` | `300` | 超过不参与复读 |
-| repeat | `cooldown_seconds` | `90` | 两次复读最小间隔 |
+| repeat | `max_text_length` | `300` | 超过不参与复读（仅文字类） |
+| repeat | `cooldown_seconds` | `90` | 两次复读最小间隔（三种内容共享） |
 | repeat | `delay_min` / `delay_max` | `0.5` / `2.0` | 复读前随机延迟（秒） |
 | repeat | `case_insensitive` | `false` | 判定忽略大小写 |
 | repeat | `normalize_whitespace` | `true` | 判定合并空白（发送仍用原文） |
-| once | `repeated_memory_ttl` | `300` | 同句"已复读"记忆时长 |
+| once | `repeated_memory_ttl` | `300` | 同内容"已复读"记忆时长（key 带 kind 前缀） |
 | planner_guard | `enabled` | `true` | 是否注入守卫提示 |
 | planner_guard | `pending_ttl` | `180` | 待注入提示有效期 |
 | filter | `ignored_user_ids` | `[]` | 不参与判定的账号（其他 bot 填这里防对撞） |
@@ -152,8 +179,11 @@ MaiBot 会把表情包消息文本化成 `[表情包：xxx]` 这样的占位文�
 | filter | `auto_exclude_self` | `true` | 不复读自己说的话 |
 | filter | `exclude_bot_names` | `true` | 文本含机器人称呼不复读 |
 | filter | `bot_names_extra` | `[]` | 额外补充的称呼 |
-| filter | `exclude_non_text` | `true` | 非文本消息不参与 |
-| filter | `exclude_keywords` | `["表情包","[图片]",…]` | 文本命中即跳过 |
+| filter | `exclude_non_text` | `true` | 非文本组件不参与**文字**复读（emoji/face 有独立通道） |
+| filter | `exclude_keywords` | `["表情包","[表情]","[图片]",…]` | 文字通道命中即跳过 |
+| sticker | `enabled` | `true` | **表情包复读开关**（WebUI 按钮） |
+| qq_face | `enabled` | `true` | **QQ原生表情复读开关**（WebUI 按钮） |
+| qq_face | `send_native` | `true` | ⚠️ 发送真实QQ表情，**仅适配 snowluma-adapter**（WebUI 按钮带提示，失败自动降级文本） |
 | debug | `dump_message_structure` | `false` | 首条消息 dump 完整结构（排查字段名用） |
 | debug | `verbose_log` | `false` | 窗口计数等冗余日志 |
 
@@ -233,8 +263,9 @@ git show v1.4.0:_manifest.json | head -6
 ## 12. 已知问题与可改进方向
 
 - `filter.bot_user_ids` 与 `auto_exclude_self` 有重叠：自动识别拿到账号后仍会合并手动列表，符合预期但配置项略显冗余
-- 只实现"文字复读"，最理想的是连图片/表情包也能原样复读，但插件只声明了 `send.text`，要发图需要 `send.image` 能力 + 图片二进制处理，尚未做
-- 复读判定用的是精确文本匹配，没有做"近似复读"（比如多了个标点）识别
+- QQ原生表情复读的 face 段出站解包依赖 snowluma-adapter（`DictComponent` 兜底通道）；其他适配器上发送失败会降级文本，但"发送成功但显示异常"的适配器无法识别——已有 `on_load` 探测告警兜底
+- 复读判定用的是精确匹配，没有做"近似复读"（比如多了个标点）识别；表情包按字节 hash 判定，同图不同压缩版本会被视为两张
+- 文字+表情混合消息（如"哈哈[表情包]"）不参与复读（分类器直接排除），未来可考虑 hybrid 发送
 - `+1.jpg`（图标原始素材）目前也在仓库里，如果不想保留可以从版本控制移除（`assets/icon.jpg` 才是实际使用的）
 
 ## 13. 版本历史
@@ -245,6 +276,7 @@ git show v1.4.0:_manifest.json | head -6
 | v1.1.0 | 排除表情包等非文本消息（关键词 + 组件类型双保险） |
 | v1.2.0 | 适配 MaiBot 1.2.5 的 planner Context Items 契约（原 `extra_prompt` 失效） |
 | v1.3.0 | 不复读自己说的话；复读文本含机器人称呼时不复读；manifest 补 display 图标 / plugin_type=extension / max_version=1.4.99 |
+| v1.4.0 | 表情包复读（send.emoji + hash 判定 + 内存缓存上限 16 条/24MB）与 QQ原生表情复读（send.custom face 段 + 内置映射表 503 项，仅适配 snowluma-adapter，失败降级文本、加载时探测告警）；消息分类重构为 text/sticker/face 三通道；两个新功能均为 WebUI 可开关配置项 |
 
 ## 14. 相关资源
 

@@ -6,6 +6,8 @@
 - once: 一次复读记忆（同一句话只复读一次）
 - planner_guard: planner 防复读守卫（复读后向 planner 注入状态提示）
 - filter: 发送人过滤（其他 bot、麦麦自己）
+- sticker: 表情包复读（跟发同款图片/GIF 表情）
+- qq_face: QQ 原生表情复读（跟发真实 QQ 小黄脸）
 - debug: 调试选项（消息结构 dump、冗余日志）
 """
 
@@ -15,7 +17,7 @@ from typing import ClassVar
 
 from maibot_sdk import Field, PluginConfigBase
 
-CONFIG_SCHEMA_VERSION = "1.0.0"
+CONFIG_SCHEMA_VERSION = "1.1.0"
 
 
 class PluginConfig(PluginConfigBase):
@@ -128,7 +130,7 @@ class OnceConfig(PluginConfigBase):
     """一次复读记忆。"""
 
     __ui_label__: ClassVar[str] = "一次复读记忆"
-    __ui_order__: ClassVar[int] = 2
+    __ui_order__: ClassVar[int] = 4
 
     repeated_memory_ttl: float = Field(
         default=300.0,
@@ -144,7 +146,7 @@ class PlannerGuardConfig(PluginConfigBase):
     """planner 防复读守卫。"""
 
     __ui_label__: ClassVar[str] = "planner 守卫"
-    __ui_order__: ClassVar[int] = 3
+    __ui_order__: ClassVar[int] = 5
 
     enabled: bool = Field(
         default=True,
@@ -168,7 +170,7 @@ class FilterConfig(PluginConfigBase):
     """发送人过滤。"""
 
     __ui_label__: ClassVar[str] = "过滤设置"
-    __ui_order__: ClassVar[int] = 4
+    __ui_order__: ClassVar[int] = 6
 
     ignored_user_ids: list[str] = Field(
         default_factory=list,
@@ -221,11 +223,54 @@ class FilterConfig(PluginConfigBase):
         },
     )
     exclude_keywords: list[str] = Field(
-        default_factory=lambda: ["表情包", "[图片]", "[动画表情]", "[语音]", "[视频]", "[文件]"],
+        default_factory=lambda: ["表情包", "[表情]", "[图片]", "[动画表情]", "[语音]", "[视频]", "[文件]"],
         description="消息文本命中任一关键词时不参与复读",
         json_schema_extra={
             "label": "排除关键词",
-            "hint": "MaiBot 会把表情包消息文本化成「[表情包：xxx]」这类占位，默认已排除。留空表示不按关键词排除。",
+            "hint": "MaiBot 会把表情包消息文本化成「[表情包：xxx]」这类占位，默认已排除（[表情] 是未知QQ表情的占位）。留空表示不按关键词排除。",
+        },
+    )
+
+
+class StickerConfig(PluginConfigBase):
+    """表情包复读。"""
+
+    __ui_label__: ClassVar[str] = "表情包复读"
+    __ui_order__: ClassVar[int] = 2
+
+    enabled: bool = Field(
+        default=True,
+        description="群友复读同一张表情包（图片/GIF/商城大表情）时，跟发同款",
+        json_schema_extra={
+            "label": "启用表情包复读",
+            "hint": "识别纯表情消息（单条只有一个表情组件），按图片内容指纹判定「同款」，"
+            "通过 ctx.send.emoji 原样回发。图片数据在内存中有数量与字节双上限缓存，自动过期清理。",
+        },
+    )
+
+
+class QQFaceConfig(PluginConfigBase):
+    """QQ 原生表情复读。"""
+
+    __ui_label__: ClassVar[str] = "QQ原生表情复读"
+    __ui_order__: ClassVar[int] = 3
+
+    enabled: bool = Field(
+        default=True,
+        description="群友复读同一个QQ原生表情（小黄脸）时，跟发同款",
+        json_schema_extra={
+            "label": "启用QQ原生表情复读",
+            "hint": "QQ表情在入站时会被文本化成「[微笑]」，插件按内置映射表反查表情 id 后跟发。"
+            "关闭后 QQ 表情按普通文本参与复读（发出的是 [微笑] 字面文本）。",
+        },
+    )
+    send_native: bool = Field(
+        default=True,
+        description="发送真实QQ表情（face 消息段）。仅适配 snowluma-adapter",
+        json_schema_extra={
+            "label": "发送真实QQ表情（仅 snowluma-adapter）",
+            "hint": "⚠️ 仅适配 snowluma-adapter：开启后通过 face 消息段发送真实QQ表情，发送失败会自动降级为文本；"
+            "使用其他适配器请关闭本项，将以 [微笑] 文本形式复读。",
         },
     )
 
@@ -234,7 +279,7 @@ class DebugConfig(PluginConfigBase):
     """调试选项。"""
 
     __ui_label__: ClassVar[str] = "调试"
-    __ui_order__: ClassVar[int] = 5
+    __ui_order__: ClassVar[int] = 7
 
     dump_message_structure: bool = Field(
         default=False,
@@ -262,4 +307,6 @@ class RepeaterSettings(PluginConfigBase):
     once: OnceConfig = Field(default_factory=OnceConfig)
     planner_guard: PlannerGuardConfig = Field(default_factory=PlannerGuardConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
+    sticker: StickerConfig = Field(default_factory=StickerConfig)
+    qq_face: QQFaceConfig = Field(default_factory=QQFaceConfig)
     debug: DebugConfig = Field(default_factory=DebugConfig)
