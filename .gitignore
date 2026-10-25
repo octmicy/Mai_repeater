@@ -23,3 +23,5 @@ temp/
 
 # 本地交接文档，不随仓库发布
 HANDOFF.md
+# 运行时配置：由 Runner 依据 config_model 自动生成与维护，不进版本控制
+/config.toml
