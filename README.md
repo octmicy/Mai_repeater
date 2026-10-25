@@ -41,7 +41,7 @@ C：[微笑]
 
 ## 配置
 
-配置定义在 `config.py` 的 config_model 中；插件目录下的 `config.toml` 是**运行时配置文件**，由主程序 Runner 依据配置模型自动生成和维护（首次加载写入全部默认值），不在本仓库版本控制内。
+配置定义在 `config.py` 的 config_model 中；插件目录下的 `config.toml` 是**运行时配置文件**，由主程序 Runner 依据配置模型自动生成和维护（首次加载写入全部默认值），不在本仓库版本控制内。仓库提供 [`config.example.toml`](config.example.toml) 作为全部字段与默认值的示例模板（真实 `config.toml` 通常无需手动创建）。
 
 修改配置：在 WebUI 里改（支持热更新），或编辑插件目录下已生成的 `config.toml` 后重启。
 

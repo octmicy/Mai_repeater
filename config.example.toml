@@ -1,0 +1,64 @@
+# Mai_repeater 示例配置模板
+#
+# 用法：复制本文件为插件目录下的 config.toml 后修改即可。
+# 通常无需手动复制——插件首次加载时，主程序 Runner 会依据 config.py 的
+# config_model 自动生成包含全部默认值的 config.toml 并在后续维护它。
+# 本文件仅作为全部字段与默认值的参考，不参与运行（真实 config.toml
+# 不进版本控制，见 .gitignore）。
+#
+# 修改配置后重启生效；或在 WebUI 插件设置页修改（支持热更新）。
+
+[plugin]
+enabled = true
+# 配置 schema 版本，由 Runner 维护，请勿手动修改
+config_version = "1.1.0"
+
+[repeat]
+min_count = 3
+min_senders = 3
+window_seconds = 120.0
+max_text_length = 300
+cooldown_seconds = 90.0
+delay_min = 0.5
+delay_max = 2.0
+case_insensitive = false
+normalize_whitespace = true
+
+[once]
+# 同一句话的已复读记忆时长（秒）：只覆盖当次复读潮的上下文，5 分钟
+repeated_memory_ttl = 300.0
+
+[planner_guard]
+enabled = true
+# 待注入提示的有效期（秒）：只注入一次，注入后立即消费；超时未消费则作废
+pending_ttl = 180.0
+
+[filter]
+ignored_user_ids = []
+bot_user_ids = []
+# 不复读自己说的话：从主程序配置读取 bot 账号（qq_account/platforms），并识别消息自带账号标识
+auto_exclude_self = true
+# 复读文本中出现机器人昵称/别名时不跟读（读取 bot.nickname / bot.alias_names）
+exclude_bot_names = true
+# 额外补充的机器人称呼（主程序里没配的昵称填这里）
+bot_names_extra = []
+# 图片/语音/视频等非文本消息不参与文字复读（表情包与QQ表情有独立复读通道，见下）
+exclude_non_text = true
+# 文字复读通道的排除关键词：表情包占位文本、未知表情占位等命中即跳过
+exclude_keywords = ["表情包", "[表情]", "[图片]", "[动画表情]", "[语音]", "[视频]", "[文件]"]
+
+[sticker]
+# 表情包复读：群友复读同一张表情包（图片/GIF/商城大表情）时跟发同款
+# 图片数据在内存中有上限缓存（16 张 / 24MB），自动过期清理
+enabled = true
+
+[qq_face]
+# QQ原生表情复读：群友复读同一个QQ小黄脸时跟发同款
+enabled = true
+# 发送真实QQ表情（face 消息段）——⚠️ 仅适配 snowluma-adapter：
+# 其他适配器可能发送失败（失败时直接不跟发，不会改发文字）；关闭本项则以 [微笑] 文本形式复读
+send_native = true
+
+[debug]
+dump_message_structure = false
+verbose_log = false
